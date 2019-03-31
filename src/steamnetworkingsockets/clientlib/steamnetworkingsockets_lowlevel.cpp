@@ -5,6 +5,12 @@
 	// 1>C:\Program Files (x86)\Microsoft Visual Studio 12.0\VC\include\chrono(749): warning C4244: '=' : conversion from '__int64' to 'time_t', possible loss of data (steamnetworkingsockets_lowlevel.cpp)
 #endif
 
+#ifdef __GNUC__
+	// src/public/tier0/basetypes.h:104:30: error: assuming signed overflow does not occur when assuming that (X + c) < X is always false [-Werror=strict-overflow]
+	// current steamrt:scout gcc "g++ (SteamRT 4.8.4-1ubuntu15~12.04+steamrt1.2+srt1) 4.8.4" requires this at the top due to optimizations
+	#pragma GCC diagnostic ignored "-Wstrict-overflow"
+#endif
+
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -14,8 +20,6 @@
 #include <vstdlib/random.h>
 #include <tier1/utlpriorityqueue.h>
 #include <tier1/utllinkedlist.h>
-#include "steamnetworkingsockets_snp_debug.h"
-#include "steamnetworkingconfig.h"
 #include "crypto.h"
 
 // Ugggggggggg MSVC VS2013 STL bug: try_lock_for doesn't actually respect the timeout, it always ends up using an infinite timeout.
@@ -32,8 +36,6 @@
 
 namespace SteamNetworkingSocketsLib {
 
-// Fake loss
-
 int g_nSteamDatagramSocketBufferSize = 128*1024;
 
 /// Global lock for all local data structures
@@ -42,17 +44,21 @@ int g_nSteamDatagramSocketBufferSize = 128*1024;
 #else
 	static std::recursive_timed_mutex s_steamDatagramTransportMutex;
 #endif
-volatile int SteamDatagramTransportLock::s_nLocked;
+int SteamDatagramTransportLock::s_nLocked;
 static SteamNetworkingMicroseconds s_usecWhenLocked;
 static std::thread::id s_threadIDLockOwner;
+static int64 s_usecLongLockWarningThreshold;
 
 void SteamDatagramTransportLock::OnLocked()
 {
 	++s_nLocked;
 	if ( s_nLocked == 1 )
 	{
-		s_usecWhenLocked = SteamDatagram_GetCurrentTime();
+		s_usecWhenLocked = SteamNetworkingSockets_GetLocalTimestamp();
 		s_threadIDLockOwner = std::this_thread::get_id();
+
+		// By default, complain if we hold the lock for more than this long
+		s_usecLongLockWarningThreshold = 20*1000;
 	}
 }
 
@@ -69,14 +75,36 @@ void SteamDatagramTransportLock::Lock()
 	OnLocked();
 }
 
+bool SteamDatagramTransportLock::TryLock( int msTimeout )
+{
+	#ifdef MSVC_STL_MUTEX_WORKAROUND
+		if ( ::WaitForSingleObject( s_hSteamDatagramTransportMutex, msTimeout ) != WAIT_OBJECT_0 )
+			return false;
+	#else
+		if ( !s_steamDatagramTransportMutex.try_lock_for( std::chrono::milliseconds( msTimeout ) ) )
+			return false;
+	#endif
+	OnLocked();
+	return true;
+}
+
 void SteamDatagramTransportLock::Unlock()
 {
-	Assert( s_nLocked > 0 );
-	SteamNetworkingMicroseconds usecElapsed = 0;
+	AssertHeldByCurrentThread();
+	SteamNetworkingMicroseconds usecElapsedTooLong = 0;
 	if ( s_nLocked == 1 )
 	{
-		usecElapsed = SteamDatagram_GetCurrentTime() - s_usecWhenLocked;
-		s_threadIDLockOwner = std::thread::id();
+
+		// We're about to do the final release.  How long did we hold the lock?
+		usecElapsedTooLong = SteamNetworkingSockets_GetLocalTimestamp() - s_usecWhenLocked;
+
+		// If that duration is acceptable, then clear it.  We need to check the
+		// threshold here because the threshold could change by another thread
+		// immediately after we release the lock.  Also, if we're debugging, all bets are
+		// off.  They could have hit a breakpoint, and we don't want to create a bunch
+		// of confusing spew with spurious asserts
+		if ( usecElapsedTooLong < s_usecLongLockWarningThreshold || Plat_IsInDebugSession() )
+			usecElapsedTooLong = 0;
 	}
 	--s_nLocked;
 	#ifdef MSVC_STL_MUTEX_WORKAROUND
@@ -85,15 +113,21 @@ void SteamDatagramTransportLock::Unlock()
 		s_steamDatagramTransportMutex.unlock();
 	#endif
 
-	// Yelp if we hold the lock for along time
-	AssertMsg1( usecElapsed < 20*1000 || Plat_IsInDebugSession(), "SteamDatagramTransportLock held for %.1fms!", usecElapsed*1e-3 );
+	// Yelp if we held the lock for longer than the threshold.
+	AssertMsg1( usecElapsedTooLong == 0, "SteamDatagramTransportLock held for %.1fms!", usecElapsedTooLong*1e-3 );
+}
+
+void SteamDatagramTransportLock::SetLongLockWarningThresholdMS( int msWarningThreshold )
+{
+	AssertHeldByCurrentThread();
+	SteamNetworkingMicroseconds usecWarningThreshold = SteamNetworkingMicroseconds{msWarningThreshold}*1000;
+	if ( s_usecLongLockWarningThreshold < usecWarningThreshold )
+		s_usecLongLockWarningThreshold = usecWarningThreshold;
 }
 
 void SteamDatagramTransportLock::AssertHeldByCurrentThread()
 {
-	// !FIXME! This is probably good enough to catch bugs, but
-	// won't fire if the lock is held by another thread.
-	Assert( s_nLocked > 0 );
+	Assert( s_nLocked > 0 ); // NOTE: This could succeed even if another thread has the lock
 	Assert( s_threadIDLockOwner == std::this_thread::get_id() );
 }
 
@@ -107,62 +141,17 @@ static void SeedWeakRandomGenerator()
 }
 
 static std::atomic<long long> s_usecTimeLastReturned;
-static std::atomic<long long> s_usecTimeOffset( (long long)( k_nMillion*24*3600*30 ) ); // Start with an offset so that a timestamp of zero is always pretty far in the past
 
-SteamNetworkingMicroseconds SteamDatagram_GetCurrentTime()
-{
-	SteamNetworkingMicroseconds usecResult;
-	long long usecLastReturned;
-	for (;;)
-	{
-		// Fetch values into locals (probably registers)
-		usecLastReturned = s_usecTimeLastReturned;
-		long long usecOffset = s_usecTimeOffset;
+// Start with an offset so that a timestamp of zero is always pretty far in the past.
+// But round it up to nice round number, so that looking at timestamps in the debugger
+// is easy to read.
+const long long k_nInitialTimestampMin = k_nMillion*24*3600*30;
+const long long k_nInitialTimestamp = 3000000000000ll;
+COMPILE_TIME_ASSERT( 2000000000000ll < k_nInitialTimestampMin );
+COMPILE_TIME_ASSERT( k_nInitialTimestampMin < k_nInitialTimestamp );
+static std::atomic<long long> s_usecTimeOffset( k_nInitialTimestamp );
 
-		// Read raw timer
-		uint64 usecRaw = Plat_USTime();
-
-		// Add offset to get value in "SteamNetworkingMicroseconds" time
-		usecResult = usecRaw + usecOffset;
-
-		// How much raw timer time (presumed to be wall clock time) has elapsed since
-		// we read the timer?
-		SteamNetworkingMicroseconds usecElapsed = usecResult - usecLastReturned;
-		Assert( usecElapsed >= 0 ); // Our raw timer function is not monotonic!  We assume this never happens!
-		const SteamNetworkingMicroseconds k_usecMaxTimestampDelta = k_nMillion; // one second
-		if ( usecElapsed <= k_usecMaxTimestampDelta )
-		{
-			// Should be the common case - only a relatively small of time has elapsed
-			break;
-		}
-		if ( !g_bWantThreadRunning && !g_bThreadInMainThread )
-		{
-			// We don't have any expectation that we should be updating the timer frequently,
-			// so  a big jump in the value just means they aren't calling it very often
-			break;
-		}
-
-		// NOTE: We should only rarely get here, and probably as a result of running under the debugger
-
-		// Adjust offset so that delta between timestamps is limited
-		long long usecNewOffset = usecOffset - ( usecElapsed - k_usecMaxTimestampDelta );
-		usecResult = usecRaw + usecNewOffset;
-
-		// Save the new offset.
-		if ( s_usecTimeOffset.compare_exchange_strong( usecOffset, usecNewOffset ) )
-			break;
-
-		// Race condition which should be extremely rare.  Some other thread changed the offset, in the time
-		// between when we fetched it and now.  (So, a really small race window!)  Just start all over from
-		// the beginning.
-	}
-
-	// Save the last value returned.  Unless another thread snuck in there while we were busy.
-	// If so, that's OK.
-	s_usecTimeLastReturned.compare_exchange_strong( usecLastReturned, usecResult );
-
-	return usecResult;
-}
+static int s_nLowLevelSupportRefCount = 0;
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -187,6 +176,9 @@ public:
 	/// Descriptor from the OS
 	SOCKET m_socket;
 
+	/// What address families are supported by this socket?
+	int m_nAddressFamilies;
+
 	/// Who to notify when we receive a packet on this socket.
 	/// This is set to null when we are asked to close the socket.
 	CRecvPacketCallback m_callback;
@@ -202,8 +194,17 @@ public:
 		Assert( m_socket != INVALID_SOCKET );
 
 		// Convert address to BSD interface
-		struct sockaddr destAddress;
-		adrTo.ToSockadr( &destAddress );
+		struct sockaddr_storage destAddress;
+		socklen_t addrSize;
+		if ( m_nAddressFamilies & k_nAddressFamily_IPv6 )
+		{
+			addrSize = sizeof(sockaddr_in6);
+			adrTo.ToSockadrIPV6( &destAddress );
+		}
+		else
+		{
+			addrSize = (socklen_t)adrTo.ToSockadr( &destAddress );
+		}
 
 		//const uint8 *pbPkt = (const uint8 *)pPkt;
 		//Log_Detailed( LOG_STEAMDATAGRAM_CLIENT, "%4db -> %s %02x %02x %02x %02x %02x ...\n",
@@ -222,16 +223,16 @@ public:
 				(DWORD)nChunks,
 				&numberOfBytesSent,
 				0, // flags
-				&destAddress,
-				sizeof(destAddress),
+				(const sockaddr *)&destAddress,
+				addrSize,
 				nullptr, // lpOverlapped
 				nullptr // lpCompletionRoutine
 			);
 			return ( r == 0 );
 		#else
 			msghdr msg;
-			msg.msg_name = &destAddress;
-			msg.msg_namelen = sizeof( destAddress );
+			msg.msg_name = (sockaddr *)&destAddress;
+			msg.msg_namelen = addrSize;
 			msg.msg_iov = const_cast<struct iovec *>( pChunks );
 			msg.msg_iovlen = nChunks;
 			msg.msg_control = nullptr;
@@ -283,7 +284,7 @@ public:
 
 		// Limit to something sane
 		msDelay = Min( msDelay, 5000 );
-		const SteamNetworkingMicroseconds usecTime = SteamDatagram_GetCurrentTime() + msDelay * 1000;
+		const SteamNetworkingMicroseconds usecTime = SteamNetworkingSockets_GetLocalTimestamp() + msDelay * 1000;
 
 		// Find the right place to insert the packet.
 		LaggedPacket *pkt = nullptr;
@@ -457,20 +458,29 @@ bool IRawUDPSocket::BSendRawPacketGather( int nChunks, const iovec *pChunks, con
 		return true;
 
 	// Fake loss?
-	if ( ( steamdatagram_fakepacketloss_send > 0 ) && ( WeakRandomFloat( 0, 100.0 ) < steamdatagram_fakepacketloss_send ) )
+	if ( RandomBoolWithOdds( g_Config_FakePacketLoss_Send.Get() ) )
 		return true;
 
 	const CRawUDPSocketImpl *self = static_cast<const CRawUDPSocketImpl *>( this );
 
 	// Fake lag?
-	int32 nPacketFakeLagTotal = steamdatagram_fakepacketlag_send;
+	int32 nPacketFakeLagTotal = g_Config_FakePacketLag_Send.Get();
 
-	// Check for simulation random packet reordering
-	if ( ( steamdatagram_fakepacketreorder_send ) > 0 && WeakRandomFloat( 0, 100.0 ) < steamdatagram_fakepacketreorder_send )
+	// Check for simulating random packet reordering
+	if ( RandomBoolWithOdds( g_Config_FakePacketReorder_Send.Get() ) )
 	{
-		nPacketFakeLagTotal += steamdatagram_fakepacketreorder_time;
+		nPacketFakeLagTotal += g_Config_FakePacketReorder_Time.Get();
 	}
 
+	// Check for simulating random packet duplication
+	if ( RandomBoolWithOdds( g_Config_FakePacketDup_Send.Get() ) )
+	{
+		int32 nDupLag = nPacketFakeLagTotal + WeakRandomInt( 0, g_Config_FakePacketDup_TimeMax.Get() );
+		nDupLag = std::max( 1, nDupLag );
+		s_packetLagQueue.LagPacket( true, self, adrTo, nDupLag, nChunks, pChunks );
+	}
+
+	// Lag the original packet?
 	if ( nPacketFakeLagTotal > 0 )
 	{
 		s_packetLagQueue.LagPacket( true, self, adrTo, nPacketFakeLagTotal, nChunks, pChunks );
@@ -510,74 +520,232 @@ void IRawUDPSocket::Close()
 	}
 }
 
-static CRawUDPSocketImpl *OpenRawUDPSocketInternal( uint32 nIP, uint16 nPort, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg )
+static SOCKET OpenUDPSocketBoundToSockAddr( const void *sockaddr, size_t len, SteamDatagramErrMsg &errMsg, int *pnIPv6AddressFamilies )
 {
+	unsigned int opt;
 
-	// We're going to need a background thread running to poll this guy
-	if ( !BSteamNetworkingSocketsInitCommon( errMsg ) )
-		return nullptr;
+	const sockaddr_in *inaddr = (const sockaddr_in *)sockaddr;
 
-	// For linux, use the "close on exec" flag, so that the socket will not be inherited
-	// by any child process that we spawn.
+	// Select socket type.  For linux, use the "close on exec" flag, so that the
+	// socket will not be inherited by any child process that we spawn.
 	int sockType = SOCK_DGRAM;
 	#ifdef LINUX
 		sockType |= SOCK_CLOEXEC;
 	#endif
 
-	// Try to create a UDP socket
-	SOCKET sock = socket( AF_INET, sockType, IPPROTO_UDP );
+	// Try to create a UDP socket using the specified family
+	SOCKET sock = socket( inaddr->sin_family, sockType, IPPROTO_UDP );
 	if ( sock == INVALID_SOCKET )
 	{
 		V_sprintf_safe( errMsg, "socket() call failed.  Error code 0x%08x.", GetLastSocketError() );
-		return nullptr;
+		return INVALID_SOCKET;
 	}
 
-	unsigned int opt;
-
+	// We always use nonblocking IO
 	opt = 1;
 	if ( ioctlsocket( sock, FIONBIO, (unsigned long*)&opt ) == -1 )
 	{
 		V_sprintf_safe( errMsg, "Failed to set socket nonblocking mode.  Error code 0x%08x.", GetLastSocketError() );
 		closesocket( sock );
-		return nullptr;
+		return INVALID_SOCKET;
 	}
 
+	// Set buffer sizes
 	opt = g_nSteamDatagramSocketBufferSize;
 	if ( setsockopt( sock, SOL_SOCKET, SO_SNDBUF, (char *)&opt, sizeof(opt) ) )
 	{
 		V_sprintf_safe( errMsg, "Failed to set socket send buffer size.  Error code 0x%08x.", GetLastSocketError() );
 		closesocket( sock );
-		return nullptr;
+		return INVALID_SOCKET;
 	}
-
 	opt = g_nSteamDatagramSocketBufferSize;
 	if ( setsockopt( sock, SOL_SOCKET, SO_RCVBUF, (char *)&opt, sizeof(opt) ) == -1 )
 	{
 		V_sprintf_safe( errMsg, "Failed to set socket recv buffer size.  Error code 0x%08x.", GetLastSocketError() );
 		closesocket( sock );
-		return nullptr;
+		return INVALID_SOCKET;
 	}
 
-	// Set bind address
-	struct sockaddr_in	address;
-	memset( &address, 0, sizeof(address) );
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = BigDWord( nIP );
-	address.sin_port = BigWord( nPort );
+	// Handle IP v6 dual stack?
+	if ( pnIPv6AddressFamilies )
+	{
 
-	// Bind it
-	if ( bind( sock, (struct sockaddr *)&address, sizeof(address) ) == -1 )
+		// Enable dual stack?
+		opt = ( *pnIPv6AddressFamilies == k_nAddressFamily_IPv6 ) ? 1 : 0;
+		if ( setsockopt( sock, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&opt, sizeof( opt ) ) != 0 )
+		{
+			if ( *pnIPv6AddressFamilies == k_nAddressFamily_IPv6 )
+			{
+				// Spew a warning, but continue
+				SpewWarning( "Failed to set socket for IPv6 only (IPV6_V6ONLY=1).  Error code 0x%08X.  Continuing anyway.\n", GetLastSocketError() );
+			}
+			else
+			{
+				// Dual stack required, or only requested?
+				if ( *pnIPv6AddressFamilies == k_nAddressFamily_DualStack )
+				{
+					V_sprintf_safe( errMsg, "Failed to set socket for dual stack (IPV6_V6ONLY=0).  Error code 0x%08X.", GetLastSocketError() );
+					closesocket( sock );
+					return INVALID_SOCKET;
+				}
+
+				// Let caller know we're IPv6 only, and spew about this.
+				SpewWarning( "Failed to set socket for dual stack (IPV6_V6ONLY=0).  Error code 0x%08X.  Continuing using IPv6 only!\n", GetLastSocketError() );
+				*pnIPv6AddressFamilies = k_nAddressFamily_IPv6;
+			}
+		}
+		else
+		{
+			// Tell caller what they've got
+			*pnIPv6AddressFamilies = opt ? k_nAddressFamily_IPv6 : k_nAddressFamily_DualStack;
+		}
+	}
+
+	// Bind it to specific desired port and/or interfaces
+	if ( bind( sock, (struct sockaddr *)sockaddr, (socklen_t)len ) == -1 )
 	{
 		V_sprintf_safe( errMsg, "Failed to bind socket.  Error code 0x%08X.", GetLastSocketError() );
 		closesocket( sock );
+		return INVALID_SOCKET;
+	}
+
+	// All good
+	return sock;
+}
+
+static CRawUDPSocketImpl *OpenRawUDPSocketInternal( CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg, const SteamNetworkingIPAddr *pAddrLocal, int *pnAddressFamilies )
+{
+	// Creating a socket *should* be fast, but sometimes the OS might need to do some work.
+	// We shouldn't do this too often, give it a little extra time.
+	SteamDatagramTransportLock::SetLongLockWarningThresholdMS( 100 );
+
+	// Make sure have been initialized
+	if ( s_nLowLevelSupportRefCount <= 0 )
+	{
+		V_strcpy_safe( errMsg, "Internal order of operations bug.  Can't create socket, because low level systems not initialized" );
+		AssertMsg( false, errMsg );
 		return nullptr;
 	}
 
-	// Read back the port we bound to
-	socklen_t cbAddress = sizeof(address);
-	if ( getsockname( sock, (struct sockaddr *)&address, &cbAddress ) != 0 )
+	// Supply defaults
+	int nAddressFamilies = pnAddressFamilies ? *pnAddressFamilies : k_nAddressFamily_Auto;
+	SteamNetworkingIPAddr addrLocal;
+	if ( pAddrLocal )
+		addrLocal = *pAddrLocal;
+	else
+		addrLocal.Clear();
+
+	// Check that the request makes sense
+	if ( addrLocal.IsIPv4() )
+	{
+		// Only IPv4 family allowed, don't even try IPv6
+		if ( nAddressFamilies == k_nAddressFamily_Auto )
+		{
+			nAddressFamilies = k_nAddressFamily_IPv4;
+		}
+		else if ( nAddressFamilies != k_nAddressFamily_IPv4 )
+		{
+			V_strcpy_safe( errMsg, "Invalid address family request when binding to IPv4 address" );
+			return nullptr;
+		}
+	}
+	else if ( addrLocal.IsIPv6AllZeros() )
+	{
+		// We can try IPv6 dual stack, and fallback to IPv4 if requested.
+		// Just make sure they didn't request a totally bogus value
+		if ( nAddressFamilies == 0 )
+		{
+			V_strcpy_safe( errMsg, "Invalid address families" );
+			return nullptr;
+		}
+	}
+	else
+	{
+		// Only IPv6 family allowed, cannot try IPv4
+		if ( nAddressFamilies == k_nAddressFamily_Auto )
+		{
+			nAddressFamilies = k_nAddressFamily_IPv6;
+		}
+		else if ( nAddressFamilies != k_nAddressFamily_IPv6 )
+		{
+			V_strcpy_safe( errMsg, "Invalid address family request when binding to IPv6 address" );
+			return nullptr;
+		}
+	}
+
+	// Try IPv6?
+	SOCKET sock = INVALID_SOCKET;
+	if ( nAddressFamilies & k_nAddressFamily_IPv6 )
+	{
+		sockaddr_in6 address6;
+		memset( &address6, 0, sizeof(address6) );
+		address6.sin6_family = AF_INET6;
+		memcpy( address6.sin6_addr.s6_addr, addrLocal.m_ipv6, 16 );
+		address6.sin6_port = BigWord( addrLocal.m_port );
+
+		// Try to get socket
+		int nIPv6AddressFamilies = nAddressFamilies;
+		sock = OpenUDPSocketBoundToSockAddr( &address6, sizeof(address6), errMsg, &nIPv6AddressFamilies );
+
+		if ( sock == INVALID_SOCKET )
+		{
+			// Allowing fallback to IPv4?
+			if ( nAddressFamilies != k_nAddressFamily_Auto )
+				return nullptr;
+
+			// Continue below, we'll try IPv4
+		}
+		else
+		{
+			nAddressFamilies = nIPv6AddressFamilies;
+		}
+	}
+
+	// Try IPv4?
+	if ( sock == INVALID_SOCKET )
+	{
+		Assert( nAddressFamilies & k_nAddressFamily_IPv4 ); // Otherwise, we should have already failed above
+
+		sockaddr_in address4;
+		memset( &address4, 0, sizeof(address4) );
+		address4.sin_family = AF_INET;
+		address4.sin_addr.s_addr = BigDWord( addrLocal.GetIPv4() );
+		address4.sin_port = BigWord( addrLocal.m_port );
+
+		// Try to get socket
+		sock = OpenUDPSocketBoundToSockAddr( &address4, sizeof(address4), errMsg, nullptr );
+
+		// If we failed, well, we have no other options left to try.
+		if ( sock == INVALID_SOCKET )
+			return nullptr;
+
+		// We re IPv4 only
+		nAddressFamilies = k_nAddressFamily_IPv4;
+	}
+
+	// Read back address we actually bound to.
+	sockaddr_storage addrBound;
+	socklen_t cbAddress = sizeof(addrBound);
+	if ( getsockname( sock, (struct sockaddr *)&addrBound, &cbAddress ) != 0 )
 	{
 		V_sprintf_safe( errMsg, "getsockname failed.  Error code 0x%08X.", GetLastSocketError() );
+		closesocket( sock );
+		return nullptr;
+	}
+	if ( addrBound.ss_family == AF_INET )
+	{
+		const sockaddr_in *boundaddr4 = (const sockaddr_in *)&addrBound;
+		addrLocal.SetIPv4( BigDWord( boundaddr4->sin_addr.s_addr ), BigWord( boundaddr4->sin_port ) );
+	}
+	else if ( addrBound.ss_family == AF_INET6 )
+	{
+		const sockaddr_in6 *boundaddr6 = (const sockaddr_in6 *)&addrBound;
+		addrLocal.SetIPv6( boundaddr6->sin6_addr.s6_addr, BigWord( boundaddr6->sin6_port ) );
+	}
+	else
+	{
+		Assert( false );
+		V_sprintf_safe( errMsg, "getsockname returned address with unexpected family %d", addrBound.ss_family );
 		closesocket( sock );
 		return nullptr;
 	}
@@ -585,8 +753,9 @@ static CRawUDPSocketImpl *OpenRawUDPSocketInternal( uint32 nIP, uint16 nPort, CR
 	// Allocate a bookkeeping structure
 	CRawUDPSocketImpl *pSock = new CRawUDPSocketImpl;
 	pSock->m_socket = sock;
-	pSock->m_nPort = BigWord( address.sin_port );
+	pSock->m_boundAddr = addrLocal;
 	pSock->m_callback = callback;
+	pSock->m_nAddressFamilies = nAddressFamilies;
 
 	// On windows, create an event used to poll efficiently
 	#ifdef _WIN32
@@ -599,21 +768,23 @@ static CRawUDPSocketImpl *OpenRawUDPSocketInternal( uint32 nIP, uint16 nPort, CR
 		}
 	#endif
 
-	SteamDatagramTransportLock scopeLock;
-
 	// Add to master list.  (Hopefully we usually won't have that many.)
 	s_vecRawSockets.AddToTail( pSock );
 
 	// Wake up background thread so we can start receiving packets on this socket immediately
 	WakeSteamDatagramThread();
 
+	// Give back info on address families
+	if ( pnAddressFamilies )
+		*pnAddressFamilies = nAddressFamilies;
+
 	// Give them something they can use
 	return pSock;
 }
 
-IRawUDPSocket *OpenRawUDPSocket( uint32 nIP, uint16 nPort, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg )
+IRawUDPSocket *OpenRawUDPSocket( CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg, SteamNetworkingIPAddr *pAddrLocal, int *pnAddressFamilies )
 {
-	return OpenRawUDPSocketInternal( nIP, nPort, callback, errMsg );
+	return OpenRawUDPSocketInternal( callback, errMsg, pAddrLocal, pnAddressFamilies );
 }
 
 /// Poll all of our sockets, and dispatch the packets received.
@@ -627,18 +798,15 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 	Assert( SteamDatagramTransportLock::s_nLocked == 1 );
 
 	#ifdef _WIN32
-		static CUtlVector<HANDLE> s_vecEvents; // avoid calling malloc every time
-		s_vecEvents.SetCount(0);
-		s_vecEvents.EnsureCapacity( s_vecRawSockets.Count()+1 );
+		HANDLE *pEvents = (HANDLE*)alloca( sizeof(HANDLE) * (s_vecRawSockets.Count()+1) );
+		int nEvents = 0;
 	#else
-		static CUtlVector<pollfd> s_vecPollFD; // avoid calling malloc every time
-		s_vecPollFD.SetCount(0);
-		s_vecPollFD.EnsureCapacity( s_vecRawSockets.Count()+1 );
+		pollfd *pPollFDs = (pollfd*)alloca( sizeof(pollfd) * (s_vecRawSockets.Count()+1) ); 
+		int nPollFDs = 0;
 	#endif
 
-	static CUtlVector<CRawUDPSocketImpl *> s_vecSocketsToPoll; // avoid calling malloc every time
-	s_vecSocketsToPoll.SetCount(0);
-	s_vecSocketsToPoll.EnsureCapacity( s_vecRawSockets.Count() );
+	CRawUDPSocketImpl **pSocketsToPoll = (CRawUDPSocketImpl **)alloca( sizeof(CRawUDPSocketImpl *) * s_vecRawSockets.Count() ); 
+	int nSocketsToPoll = 0;
 
 	for ( CRawUDPSocketImpl *pSock: s_vecRawSockets )
 	{
@@ -646,12 +814,12 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 		Assert( pSock->m_callback.m_fnCallback );
 		Assert( pSock->m_socket != INVALID_SOCKET );
 
-		s_vecSocketsToPoll.AddToTail( pSock );
+		pSocketsToPoll[ nSocketsToPoll++ ] = pSock;
 
 		#ifdef _WIN32
-			s_vecEvents.AddToTail( pSock->m_event );
+			pEvents[ nEvents++ ] = pSock->m_event;
 		#else
-			pollfd *p = s_vecPollFD.AddToTailGetPtr();
+			pollfd *p = &pPollFDs[ nPollFDs++ ];
 			p->fd = pSock->m_socket;
 			p->events = POLLRDNORM;
 			p->revents = 0;
@@ -660,10 +828,10 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 
 	#ifdef _WIN32
 		Assert( s_hEventWakeThread != NULL && s_hEventWakeThread != INVALID_HANDLE_VALUE );
-		s_vecEvents.AddToTail( s_hEventWakeThread );
+		pEvents[ nEvents++ ] = s_hEventWakeThread;
 	#else
 		Assert( s_hSockWakeThreadRead != INVALID_SOCKET );
-		pollfd *p = s_vecPollFD.AddToTailGetPtr();
+		pollfd *p = &pPollFDs[ nPollFDs++ ];
 		p->fd = s_hSockWakeThreadRead;
 		p->events = POLLRDNORM;
 		p->revents = 0;
@@ -678,12 +846,12 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 
 	// Wait for data on one of the sockets, or for us to be asked to wake up
 	#if defined( WIN32 )
-		DWORD nWaitResult = WaitForMultipleObjects( s_vecEvents.Count(), s_vecEvents.Base(), FALSE, nMaxTimeoutMS );
+		DWORD nWaitResult = WaitForMultipleObjects( nEvents, pEvents, FALSE, nMaxTimeoutMS );
 	#else
-		poll( s_vecPollFD.Base(), s_vecPollFD.Count(), nMaxTimeoutMS );
+		poll( pPollFDs, nPollFDs, nMaxTimeoutMS );
 	#endif
 
-	SteamNetworkingMicroseconds usecStartedLocking = SteamDatagram_GetCurrentTime();
+	SteamNetworkingMicroseconds usecStartedLocking = SteamNetworkingSockets_GetLocalTimestamp();
 	for (;;)
 	{
 
@@ -695,23 +863,15 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 
 		// Try to acquire the lock.  But don't wait forever, in case the other thread has the lock
 		// and then makes a shutdown request while we're waiting on the lock here.
-		if (
-			#ifdef MSVC_STL_MUTEX_WORKAROUND
-				::WaitForSingleObject( s_hSteamDatagramTransportMutex, 250 ) == WAIT_OBJECT_0
-			#else
-				s_steamDatagramTransportMutex.try_lock_for( std::chrono::milliseconds( 250 ) )
-			#endif
-		) {
-			SteamDatagramTransportLock::OnLocked();
+		if ( SteamDatagramTransportLock::TryLock( 250 ) )
 			break;
-		}
 
 		// The only time this really should happen is a relatively rare race condition
 		// where the main thread is trying to shut us down.  (Or while debugging.)
 		// However, note that try_lock_for is permitted to "fail" spuriously, returning
 		// false even if no other thread holds the lock.  (For performance reasons.)
 		// So we check how long we have actually been waiting.
-		SteamNetworkingMicroseconds usecElapsed = SteamDatagram_GetCurrentTime() - usecStartedLocking;
+		SteamNetworkingMicroseconds usecElapsed = SteamNetworkingSockets_GetLocalTimestamp() - usecStartedLocking;
 		AssertMsg1( usecElapsed < 50*1000 || !g_bWantThreadRunning || Plat_IsInDebugSession(), "SDR service thread gave up on lock after waiting %dms.  This directly adds to delay of processing of network packets!", int( usecElapsed/1000 ) );
 	}
 
@@ -723,10 +883,10 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 	// then we will check all sockets later in the array.
 	//
 	// Note that if we get a wake request, the event has already been reset, because we used an auto-reset event
-	for ( int idx = nWaitResult - WAIT_OBJECT_0 ; (unsigned)idx < (unsigned)s_vecSocketsToPoll.Count() ; ++idx )
+	for ( int idx = nWaitResult - WAIT_OBJECT_0 ; (unsigned)idx < (unsigned)nSocketsToPoll ; ++idx )
 	{
 
-		CRawUDPSocketImpl *pSock = s_vecSocketsToPoll[ idx ];
+		CRawUDPSocketImpl *pSock = pSocketsToPoll[ idx ];
 
 		// Check if this socket has anything, and clear the event
 		WSANETWORKEVENTS wsaEvents;
@@ -738,22 +898,22 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 		if ( !(wsaEvents.lNetworkEvents & FD_READ) )
 			continue;
 #else
-	for ( int idx = 0 ; idx < s_vecPollFD.Count() ; ++idx )
+	for ( int idx = 0 ; idx < nPollFDs ; ++idx )
 	{
-		if ( !( s_vecPollFD[ idx ].revents & POLLRDNORM ) )
+		if ( !( pPollFDs[ idx ].revents & POLLRDNORM ) )
 			continue;
-		if ( idx >= s_vecSocketsToPoll.Count() )
+		if ( idx >= nSocketsToPoll )
 		{
 			// It's a wake request.  Pull a single packet out of the queue.
 			// We want one wake request to always result in exactly one wake up.
 			// Wake request are relatively rare, and we don't want to skip any
 			// or combine them.  That would result in complicated race conditions
 			// where we stay asleep a lot longer than we should.
-			Assert( s_vecPollFD[idx].fd == s_hSockWakeThreadRead );
+			Assert( pPollFDs[idx].fd == s_hSockWakeThreadRead );
 			::recv( s_hSockWakeThreadRead, buf, sizeof(buf), 0 );
 			continue;
 		}
-		CRawUDPSocketImpl *pSock = s_vecSocketsToPoll[ idx ];
+		CRawUDPSocketImpl *pSock = pSocketsToPoll[ idx ];
 #endif
 
 		// Drain the socket.  But if the callback gets cleared, that
@@ -764,7 +924,7 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 			if ( !g_bWantThreadRunning )
 				return true; // current thread owns the lock
 
-			sockaddr_in from;
+			sockaddr_storage from;
 			socklen_t fromlen = sizeof(from);
 			int ret = ::recvfrom( pSock->m_socket, buf, sizeof( buf ), 0, (sockaddr *)&from, &fromlen );
 
@@ -780,23 +940,38 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS )
 			// NOTE 2: 0 byte datagram is possible, and in this case recvfrom will return 0.
 			// (But all of our protocols enforce a minimum packet size, so if we get a zero byte packet,
 			// it's a bogus.  We could drop it here but let's send it through the normal mechanism to
-			// be handled/reported int he same way as any other bogus packet.)
+			// be handled/reported in the same way as any other bogus packet.)
 			if ( ret < 0 )
 				break;
 
 			// Check for simulating random packet loss
-			if ( ( steamdatagram_fakepacketloss_recv ) > 0 && ( WeakRandomFloat( 0, 100.0 ) < steamdatagram_fakepacketloss_recv ) )
+			if ( RandomBoolWithOdds( g_Config_FakePacketLoss_Recv.Get() ) )
 				continue;
 
 			netadr_t adr;
-			adr.SetFromSockadr( (sockaddr*)&from );
+			adr.SetFromSockadr( &from );
 
-			int32 nPacketFakeLagTotal = steamdatagram_fakepacketlag_recv;
+			// If we're dual stack, convert mapped IPv4 back to ordinary IPv4
+			if ( pSock->m_nAddressFamilies == k_nAddressFamily_DualStack )
+				adr.BConvertMappedToIPv4();
 
-			// Check for simulation random packet reordering
-			if ( ( steamdatagram_fakepacketreorder_recv ) > 0 && WeakRandomFloat( 0, 100.0 ) < steamdatagram_fakepacketreorder_recv )
+			int32 nPacketFakeLagTotal = g_Config_FakePacketLag_Recv.Get();
+
+			// Check for simulating random packet reordering
+			if ( RandomBoolWithOdds( g_Config_FakePacketReorder_Recv.Get() ) )
 			{
-				nPacketFakeLagTotal += steamdatagram_fakepacketreorder_time;
+				nPacketFakeLagTotal += g_Config_FakePacketReorder_Time.Get();
+			}
+
+			// Check for simulating random packet duplication
+			if ( RandomBoolWithOdds( g_Config_FakePacketDup_Recv.Get() ) )
+			{
+				int32 nDupLag = nPacketFakeLagTotal + WeakRandomInt( 0, g_Config_FakePacketDup_TimeMax.Get() );
+				nDupLag = std::max( 1, nDupLag );
+				iovec temp;
+				temp.iov_len = ret;
+				temp.iov_base = buf;
+				s_packetLagQueue.LagPacket( false, pSock, adr, nDupLag, 1, &temp );
 			}
 
 			// Check for simulating lag
@@ -871,6 +1046,7 @@ IThinker::~IThinker()
 }
 
 #ifdef __GNUC__
+	// older steamrt:scout gcc requires this also, probably getting confused by unbalanced push/pop
 	#pragma GCC diagnostic ignored "-Wstrict-overflow"
 #endif
 
@@ -1011,7 +1187,6 @@ void IThinker::EnsureMinThinkTime( SteamNetworkingMicroseconds usecTargetThinkTi
 
 void ProcessThinkers()
 {
-	SteamNetworkingMicroseconds usecNow = SteamDatagram_GetCurrentTime();
 
 	// Until the queue is empty
 	while ( s_queueThinkers.Count() > 0 )
@@ -1019,6 +1194,14 @@ void ProcessThinkers()
 
 		// Grab the head element
 		IThinker *pNextThinker = s_queueThinkers.ElementAtHead();
+
+		// Refetch timestamp each time.  The reason is that certain thinkers
+		// may pass through to other systems (e.g. fake lag) that fetch the time.
+		// If we don't update the time here, that code may have used the newer
+		// timestamp (e.g. to mark when a packet was received) and then
+		// in our next iteration, we will use an older timestamp to process
+		// a thinker.
+		SteamNetworkingMicroseconds usecNow = SteamNetworkingSockets_GetLocalTimestamp();
 
 		// Scheduled too far in the future?  Note that
 		// there could be other items in the queue with
@@ -1058,8 +1241,7 @@ void ProcessThinkers()
 //
 /////////////////////////////////////////////////////////////////////////////
 
-volatile bool g_bWantThreadRunning;
-volatile bool g_bThreadInMainThread;
+std::atomic<bool> g_bWantThreadRunning;
 
 static void SteamDatagramThreadProc()
 {
@@ -1068,9 +1250,11 @@ static void SteamDatagramThreadProc()
 	// we need to take priority above normal threads and wake up immediately
 	// to process the packet.  We should be asleep most of the time waiting
 	// for packets to arrive.
-	#ifdef _WIN32
-		DbgVerify( SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_HIGHEST ) );
+	#if defined(_WIN32)
+	DbgVerify( SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_HIGHEST ) );
+	#endif
 
+	#if defined(_WIN32) && !defined(GNU_COMPILER)
 		typedef struct tagTHREADNAME_INFO
 		{
 			DWORD dwType;
@@ -1100,8 +1284,14 @@ static void SteamDatagramThreadProc()
 		// totally straightforward the correct way to do this on Linux.
 	#endif
 
-	// We will hold global lock while we're awake.
-	SteamDatagramTransportLock::Lock();
+	// In the loop, we will always hold global lock while we're awake.
+	// So go ahead and acquire it now.  But watch out for a race condition
+	// where we want to shut down immediately after starting the thread
+	do
+	{
+		if ( !g_bWantThreadRunning )
+			return;
+	} while ( !SteamDatagramTransportLock::TryLock( 10 ) );
 
 	// Random number generator may be per thread!  Make sure and see it for
 	// this thread, if so
@@ -1122,7 +1312,7 @@ static void SteamDatagramThreadProc()
 			// Calc wait time to wake up as late as possible,
 			// routed up to the nearest millisecond.
 			SteamNetworkingMicroseconds usecNextWakeTime = pNextThinker->GetLatestThinkTime();
-			SteamNetworkingMicroseconds usecNow = SteamDatagram_GetCurrentTime();
+			SteamNetworkingMicroseconds usecNow = SteamNetworkingSockets_GetLocalTimestamp();
 			int64 usecUntilNextThinkTime = usecNextWakeTime - usecNow;
 
 			if ( usecNow >= pNextThinker->GetEarliestThinkTime() )
@@ -1199,23 +1389,7 @@ static void SteamDatagramThreadProc()
 		// We can close the sockets safely now, because we know we're
 		// not polling on them and we know we hold the lock
 		ProcessPendingDestroyClosedRawUDPSockets();
-
-		if ( g_bThreadInMainThread )
-		{
-			SteamDatagramTransportLock::Unlock();
-			break; // We'll get called again shortly
-		}
 	}
-}
-
-// If we're in a debugger, we don't run it as a thread, run in the main thread to make debugging easier
-void CallDatagramThreadProc()
-{
-	if ( !g_bThreadInMainThread )
-	{
-		return;
-	}
-	SteamDatagramThreadProc();
 }
 
 static bool BEnsureSteamDatagramThreadRunning( SteamDatagramErrMsg &errMsg )
@@ -1225,13 +1399,7 @@ static bool BEnsureSteamDatagramThreadRunning( SteamDatagramErrMsg &errMsg )
 	// just before we start up our thread, so we don't lurch
 	// on our first reading after the thread is running and
 	// take action to correct this.
-	SteamDatagram_GetCurrentTime();
-
-	if ( g_bThreadInMainThread )
-	{
-		Assert( !s_pThreadSteamDatagram );
-		return true;
-	}
+	SteamNetworkingSockets_GetLocalTimestamp();
 
 	if ( s_pThreadSteamDatagram )
 	{
@@ -1286,16 +1454,6 @@ static bool BEnsureSteamDatagramThreadRunning( SteamDatagramErrMsg &errMsg )
 	// Create the thread and start socket processing
 	g_bWantThreadRunning = true;
 
-	// When running under the debugger, don't create a thread, just pump it through calls via
-	// Temp_DispatchsSteamNetConnectionStatusChangedCallbacks which we should rename to 
-	// SteamDatagramRunFrame() or something
-// !FIXME!
-//	if ( CommandLine()->HasParm( "-nosgthread" ) )
-//	{
-//		g_bThreadInMainThread = true;
-//		return true;
-//	}
-
 	s_pThreadSteamDatagram = new std::thread( SteamDatagramThreadProc );
 
 	return true;
@@ -1303,7 +1461,6 @@ static bool BEnsureSteamDatagramThreadRunning( SteamDatagramErrMsg &errMsg )
 
 static void StopSteamDatagramThread()
 {
-	ShutdownSNPDebugWindow();
 
 	// Should only be called while we have the lock
 	SteamDatagramTransportLock::AssertHeldByCurrentThread();
@@ -1381,7 +1538,7 @@ static void DedicatedBoundSocketCallback( const void *pPkt, int cbPkt, const net
 		// Packets from random internet hosts happen all the time,
 		// especially on a LAN where all sorts of people have broadcast
 		// discovery protocols.  So this probably isn't a bug or a problem.
-		SpewVerbose( "Ignoring stray packet from %s received on port %d.  Should only be talking to %s on that port.\n", CUtlNetAdrRender( adrFrom ).String(), pSock->GetRawSock()->m_nPort, CUtlNetAdrRender( pSock->GetRemoteHostAddr() ).String() );
+		SpewVerbose( "Ignoring stray packet from %s received on port %d.  Should only be talking to %s on that port.\n", CUtlNetAdrRender( adrFrom ).String(), pSock->GetRawSock()->m_boundAddr.m_port, CUtlNetAdrRender( pSock->GetRemoteHostAddr() ).String() );
 		return;
 	}
 
@@ -1393,13 +1550,18 @@ static void DedicatedBoundSocketCallback( const void *pPkt, int cbPkt, const net
 	pSock->m_callback( pPkt, cbPkt, adrFrom );
 }
 
-IBoundUDPSocket *OpenUDPSocketBoundToHost( uint32 nLocalIP, uint16 nLocalPort, const netadr_t &adrRemote, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg )
+IBoundUDPSocket *OpenUDPSocketBoundToHost( const netadr_t &adrRemote, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg )
 {
-	SteamDatagramTransportLock scopeLock;
+	SteamDatagramTransportLock::AssertHeldByCurrentThread();
+
+	// Select local address to use.
+	// Since we know the remote host, let's just always use a single-stack socket
+	// with the specified family
+	int nAddressFamilies = ( adrRemote.GetType() == NA_IPV6 ) ? k_nAddressFamily_IPv6 : k_nAddressFamily_IPv4;
 
 	// Create a socket, bind it to the desired local address
 	CDedicatedBoundSocket *pTempContext = nullptr; // don't yet know the context
-	CRawUDPSocketImpl *pRawSock = OpenRawUDPSocketInternal( nLocalIP, nLocalPort, CRecvPacketCallback( DedicatedBoundSocketCallback, pTempContext ), errMsg );
+	CRawUDPSocketImpl *pRawSock = OpenRawUDPSocketInternal( CRecvPacketCallback( DedicatedBoundSocketCallback, pTempContext ), errMsg, nullptr, &nAddressFamilies );
 	if ( !pRawSock )
 		return nullptr;
 
@@ -1413,16 +1575,20 @@ IBoundUDPSocket *OpenUDPSocketBoundToHost( uint32 nLocalIP, uint16 nLocalPort, c
 
 bool CreateBoundSocketPair( CRecvPacketCallback callback1, CRecvPacketCallback callback2, IBoundUDPSocket **ppOutSockets, SteamDatagramErrMsg &errMsg )
 {
-	SteamDatagramTransportLock scopeLock;
+	SteamDatagramTransportLock::AssertHeldByCurrentThread();
 
-	// Create two socket UDP sockets, bound to loopback IP, but allow OS to choose ephemeral port
+	SteamNetworkingIPAddr localAddr;
+
+	// Create two socket UDP sockets, bound to (IPv4) loopback IP, but allow OS to choose ephemeral port
 	CRawUDPSocketImpl *pRawSock[2];
 	uint32 nLocalIP = 0x7f000001; // 127.0.0.1
 	CDedicatedBoundSocket *pTempContext = nullptr; // don't yet know the context
-	pRawSock[0] = OpenRawUDPSocketInternal( nLocalIP, 0, CRecvPacketCallback( DedicatedBoundSocketCallback, pTempContext ), errMsg );
+	localAddr.SetIPv4( nLocalIP, 0 );
+	pRawSock[0] = OpenRawUDPSocketInternal( CRecvPacketCallback( DedicatedBoundSocketCallback, pTempContext ), errMsg, &localAddr, nullptr );
 	if ( !pRawSock[0] )
 		return false;
-	pRawSock[1] = OpenRawUDPSocketInternal( nLocalIP, 0, CRecvPacketCallback( DedicatedBoundSocketCallback, pTempContext ), errMsg );
+	localAddr.SetIPv4( nLocalIP, 0 );
+	pRawSock[1] = OpenRawUDPSocketInternal( CRecvPacketCallback( DedicatedBoundSocketCallback, pTempContext ), errMsg, &localAddr, nullptr );
 	if ( !pRawSock[1] )
 	{
 		delete pRawSock[0];
@@ -1432,7 +1598,7 @@ bool CreateBoundSocketPair( CRecvPacketCallback callback1, CRecvPacketCallback c
 	// Return wrapper interfaces that can only talk to each other
 	for ( int i = 0 ; i < 2 ; ++i )
 	{
-		auto s = new CDedicatedBoundSocket( pRawSock[i], netadr_t( nLocalIP, pRawSock[1-i]->m_nPort ) );
+		auto s = new CDedicatedBoundSocket( pRawSock[i], netadr_t( nLocalIP, pRawSock[1-i]->m_boundAddr.m_port ) );
 		pRawSock[i]->m_callback.m_pContext = s;
 		s->m_callback = (i == 0 ) ? callback1 : callback2;
 		ppOutSockets[i] = s;
@@ -1463,13 +1629,14 @@ void CSharedSocket::CallbackRecvPacket( const void *pPkt, int cbPkt, const netad
 	callback( pPkt, cbPkt, adrFrom );
 }
 
-bool CSharedSocket::BInit( uint32 nIP, uint16 nPort, CRecvPacketCallback callbackDefault, SteamDatagramErrMsg &errMsg )
+bool CSharedSocket::BInit( const SteamNetworkingIPAddr &localAddr, CRecvPacketCallback callbackDefault, SteamDatagramErrMsg &errMsg )
 {
 	SteamDatagramTransportLock::AssertHeldByCurrentThread();
 
 	Kill();
 
-	m_pRawSock = OpenRawUDPSocket( nIP, nPort, CRecvPacketCallback( CallbackRecvPacket, this ), errMsg );
+	SteamNetworkingIPAddr bindAddr = localAddr;
+	m_pRawSock = OpenRawUDPSocket( CRecvPacketCallback( CallbackRecvPacket, this ), errMsg, &bindAddr, nullptr );
 	if ( m_pRawSock == nullptr )
 		return false;
 
@@ -1487,7 +1654,7 @@ void CSharedSocket::Kill()
 		m_pRawSock->Close();
 		m_pRawSock = nullptr;
 	}
-	FOR_EACH_MAP_FAST( m_mapRemoteHosts, idx )
+	FOR_EACH_HASHMAP( m_mapRemoteHosts, idx )
 	{
 		CloseRemoteHostByIndex( idx );
 	}
@@ -1541,15 +1708,16 @@ void CSharedSocket::RemoteHost::Close()
 //
 /////////////////////////////////////////////////////////////////////////////
 
-ESteamDatagramDebugOutputType g_eSteamDatagramDebugOutputDetailLevel;
-static FSteamDatagramDebugOutput s_pfnDebugOutput = nullptr;
+SteamNetworkingMicroseconds g_usecLastRateLimitSpew;
+ESteamNetworkingSocketsDebugOutputType g_eSteamDatagramDebugOutputDetailLevel;
+static FSteamNetworkingSocketsDebugOutput s_pfnDebugOutput = nullptr;
 
-void ReallySpewType( ESteamDatagramDebugOutputType eType, const char *pMsg, ... )
+void ReallySpewType( ESteamNetworkingSocketsDebugOutputType eType, const char *pMsg, ... )
 {
 	// Save callback.  Paranoia for unlikely but possible race condition,
 	// if we spew from more than one place in our code and stuff changes
 	// while we are formatting.
-	FSteamDatagramDebugOutput pfnDebugOutput = s_pfnDebugOutput;
+	FSteamNetworkingSocketsDebugOutput pfnDebugOutput = s_pfnDebugOutput;
 
 	// Filter, just in case.  (We really shouldn't get here, though.)
 	if ( !pfnDebugOutput || eType > g_eSteamDatagramDebugOutputDetailLevel )
@@ -1569,6 +1737,7 @@ void ReallySpewType( ESteamDatagramDebugOutputType eType, const char *pMsg, ... 
 	pfnDebugOutput( eType, buf );
 }
 
+#ifdef STEAMNETWORKINGSOCKETS_STANDALONELIB
 static SpewRetval_t SDRSpewFunc( SpewType_t type, tchar const *pMsg )
 {
 	V_StripTrailingWhitespaceASCII( const_cast<tchar*>( pMsg ) );
@@ -1581,18 +1750,18 @@ static SpewRetval_t SDRSpewFunc( SpewType_t type, tchar const *pMsg )
 			// |
 			// V
 		case SPEW_MESSAGE:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamDatagramDebugOutputType_Msg )
-				s_pfnDebugOutput( k_ESteamDatagramDebugOutputType_Msg, pMsg );
+			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Msg )
+				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Msg, pMsg );
 			break;
 
 		case SPEW_WARNING:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamDatagramDebugOutputType_Warning )
-				s_pfnDebugOutput( k_ESteamDatagramDebugOutputType_Warning, pMsg );
+			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Warning )
+				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Warning, pMsg );
 			break;
 
 		case SPEW_ASSERT:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamDatagramDebugOutputType_Error )
-				s_pfnDebugOutput( k_ESteamDatagramDebugOutputType_Bug, pMsg );
+			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Error )
+				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Bug, pMsg );
 
 			// Ug, for some reason this is crashing, because it's trying to generate a breakpoint
 			// even when it's not being run under the debugger.  Probably the best thing to do is just rely
@@ -1601,69 +1770,99 @@ static SpewRetval_t SDRSpewFunc( SpewType_t type, tchar const *pMsg )
 			break;
 
 		case SPEW_ERROR:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamDatagramDebugOutputType_Error )
-				s_pfnDebugOutput( k_ESteamDatagramDebugOutputType_Error, pMsg );
+			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Error )
+				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Error, pMsg );
 			return SPEW_ABORT;
 
 		case SPEW_BOLD_MESSAGE:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamDatagramDebugOutputType_Important )
-				s_pfnDebugOutput( k_ESteamDatagramDebugOutputType_Important, pMsg );
+			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Important )
+				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Important, pMsg );
 	}
 	
 	return SPEW_CONTINUE;
 }
+#endif
 
-static bool s_bSteamDatagramInitted = false;
-
-bool BSteamNetworkingSocketsInitCommon( SteamDatagramErrMsg &errMsg )
+bool BSteamNetworkingSocketsLowLevelAddRef( SteamDatagramErrMsg &errMsg )
 {
 	SteamDatagramTransportLock::AssertHeldByCurrentThread();
 
-	if ( s_bSteamDatagramInitted )
-		return true;
+	// First time init?
+	if ( s_nLowLevelSupportRefCount == 0 )
+	{
+		CCrypto::Init();
 
-	// Init sockets
-	#ifdef _WIN32
-		WSAData wsaData;
-		if ( ::WSAStartup( MAKEWORD(2, 2), &wsaData ) != 0 ) 
-		{
-			V_strcpy_safe( errMsg, "WSAStartup failed" );
-			return false;
-		}
-	#endif
+		// Give us a extra time here.  This is a one-time init function and the OS might
+		// need to load up libraries and stuff.
+		SteamDatagramTransportLock::SetLongLockWarningThresholdMS( 500 );
 
-	// Latch Steam codebase's logging system so we get spew and asserts
-	SpewOutputFunc( SDRSpewFunc );
+		// Init sockets
+		#ifdef _WIN32
+			WSAData wsaData;
+			if ( ::WSAStartup( MAKEWORD(2, 2), &wsaData ) != 0 ) 
+			{
+				V_strcpy_safe( errMsg, "WSAStartup failed" );
+				return false;
+			}
+		#endif
 
-	// Make sure random number generator is seeded
-	SeedWeakRandomGenerator();
+		// Latch Steam codebase's logging system so we get spew and asserts
+		#ifdef STEAMNETWORKINGSOCKETS_STANDALONELIB
+			SpewOutputFunc( SDRSpewFunc );
+		#endif
+
+		// Make sure random number generator is seeded
+		SeedWeakRandomGenerator();
+	}
 
 	//extern void KludgePrintPublicKey();
 	//KludgePrintPublicKey();
 
-	s_bSteamDatagramInitted = true;
+	++s_nLowLevelSupportRefCount;
 
 	// Fire up the thread
 	if ( !BEnsureSteamDatagramThreadRunning( errMsg ) )
 	{
-		SteamNetworkingSocketsKillCommon();
+		SteamNetworkingSocketsLowLevelDecRef();
 		return false;
 	}
 
 	return true;
 }
 
-void SteamNetworkingSocketsKillCommon()
+void SteamNetworkingSocketsLowLevelDecRef()
 {
+	SteamDatagramTransportLock::AssertHeldByCurrentThread();
+	Assert( s_nLowLevelSupportRefCount > 0 );
+
+	// Last user is now done?
+	--s_nLowLevelSupportRefCount;
+	if ( s_nLowLevelSupportRefCount > 0 )
+		return;
+
+	// Give us a extra time here.  This is a one-time shutdown function.
+	// There is a potential race condition / deadlock with the service thread,
+	// that might cause us to have to wait for it to timeout.  And the OS
+	// might need to do stuff when we close a bunch of sockets (and WSACleanup)
+	SteamDatagramTransportLock::SetLongLockWarningThresholdMS( 500 );
+
+	if ( s_vecRawSockets.IsEmpty() )
+	{
+		s_vecRawSockets.Purge();
+	}
+	else
+	{
+		AssertMsg( false, "Trying to close low level socket support, but we still have sockets open!" );
+	}
+
 	// Shutdown the thread
 	StopSteamDatagramThread();
 
+	// Make sure we actually destroy socket objects.  It's safe to do so now.
 	ProcessPendingDestroyClosedRawUDPSockets();
-	AssertMsg( s_vecRawSockets.IsEmpty(), "SteamDatagramKillCommon() called, but sockets left open!" );
 
-	if ( !s_bSteamDatagramInitted )
-		return;
-	s_bSteamDatagramInitted = false;
+	Assert( s_vecRawSocketsPendingDeletion.IsEmpty() );
+	s_vecRawSocketsPendingDeletion.Purge();
 
 	// Nuke sockets
 	#ifdef _WIN32
@@ -1671,26 +1870,82 @@ void SteamNetworkingSocketsKillCommon()
 	#endif
 }
 
-
-} // namespace SteamNetworkingSocketsLib
-
-/////////////////////////////////////////////////////////////////////////////
-//
-// API entry points
-//
-/////////////////////////////////////////////////////////////////////////////
-
-STEAMDATAGRAMLIB_INTERFACE void SteamDatagram_SetDebugOutputFunction( /* ESteamDatagramSpewType */ int eDetailLevel, FSteamDatagramDebugOutput pfnFunc )
+#ifdef DBGFLAG_VALIDATE
+void SteamNetworkingSocketsLowLevelValidate( CValidator &validator )
 {
-	if ( pfnFunc && eDetailLevel > k_ESteamDatagramDebugOutputType_None )
+	ValidateRecursive( s_vecRawSockets );
+	ValidateObj( s_queueThinkers );
+}
+#endif
+
+void SteamNetworkingSockets_SetDebugOutputFunction( ESteamNetworkingSocketsDebugOutputType eDetailLevel, FSteamNetworkingSocketsDebugOutput pfnFunc )
+{
+	if ( pfnFunc && eDetailLevel > k_ESteamNetworkingSocketsDebugOutputType_None )
 	{
 		SteamNetworkingSocketsLib::s_pfnDebugOutput = pfnFunc;
-		SteamNetworkingSocketsLib::g_eSteamDatagramDebugOutputDetailLevel = ESteamDatagramDebugOutputType( eDetailLevel );
+		SteamNetworkingSocketsLib::g_eSteamDatagramDebugOutputDetailLevel = ESteamNetworkingSocketsDebugOutputType( eDetailLevel );
 	}
 	else
 	{
 		SteamNetworkingSocketsLib::s_pfnDebugOutput = nullptr;
-		SteamNetworkingSocketsLib::g_eSteamDatagramDebugOutputDetailLevel = k_ESteamDatagramDebugOutputType_None;
+		SteamNetworkingSocketsLib::g_eSteamDatagramDebugOutputDetailLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
 	}
 }
+
+SteamNetworkingMicroseconds SteamNetworkingSockets_GetLocalTimestamp()
+{
+	SteamNetworkingMicroseconds usecResult;
+	long long usecLastReturned;
+	for (;;)
+	{
+		// Fetch values into locals (probably registers)
+		usecLastReturned = SteamNetworkingSocketsLib::s_usecTimeLastReturned;
+		long long usecOffset = SteamNetworkingSocketsLib::s_usecTimeOffset;
+
+		// Read raw timer
+		uint64 usecRaw = Plat_USTime();
+
+		// Add offset to get value in "SteamNetworkingMicroseconds" time
+		usecResult = usecRaw + usecOffset;
+
+		// How much raw timer time (presumed to be wall clock time) has elapsed since
+		// we read the timer?
+		SteamNetworkingMicroseconds usecElapsed = usecResult - usecLastReturned;
+		Assert( usecElapsed >= 0 ); // Our raw timer function is not monotonic!  We assume this never happens!
+		const SteamNetworkingMicroseconds k_usecMaxTimestampDelta = k_nMillion; // one second
+		if ( usecElapsed <= k_usecMaxTimestampDelta )
+		{
+			// Should be the common case - only a relatively small of time has elapsed
+			break;
+		}
+		if ( !SteamNetworkingSocketsLib::g_bWantThreadRunning )
+		{
+			// We don't have any expectation that we should be updating the timer frequently,
+			// so  a big jump in the value just means they aren't calling it very often
+			break;
+		}
+
+		// NOTE: We should only rarely get here, and probably as a result of running under the debugger
+
+		// Adjust offset so that delta between timestamps is limited
+		long long usecNewOffset = usecOffset - ( usecElapsed - k_usecMaxTimestampDelta );
+		usecResult = usecRaw + usecNewOffset;
+
+		// Save the new offset.
+		if ( SteamNetworkingSocketsLib::s_usecTimeOffset.compare_exchange_strong( usecOffset, usecNewOffset ) )
+			break;
+
+		// Race condition which should be extremely rare.  Some other thread changed the offset, in the time
+		// between when we fetched it and now.  (So, a really small race window!)  Just start all over from
+		// the beginning.
+	}
+
+	// Save the last value returned.  Unless another thread snuck in there while we were busy.
+	// If so, that's OK.
+	SteamNetworkingSocketsLib::s_usecTimeLastReturned.compare_exchange_strong( usecLastReturned, usecResult );
+
+	return usecResult;
+}
+
+} // namespace SteamNetworkingSocketsLib
 

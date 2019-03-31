@@ -14,108 +14,27 @@
 
 #include "tier0/dbg.h"
 #include "tier1/bitstring.h"
-#include "tier1/generichash.h"
-#include "tier1/utlstring.h"
 #include "tier1/utliterator.h"
 #include "tier1/utlvector.h"
 
 #define FOR_EACH_HASHMAP( mapName, iteratorName ) \
 	for ( int iteratorName = 0; iteratorName < (mapName).MaxElement(); ++iteratorName ) if ( !(mapName).IsValidIndex( iteratorName ) ) continue; else
 
-// default comparison operator
-template <typename T>
-class CDefEquals
-{
-public:
-	CDefEquals() {}
-	CDefEquals( int i ) {}
-	inline bool operator()( const T &lhs, const T &rhs ) const { return ( lhs == rhs );	}
-	inline bool operator!() const { return false; }
-};
-
-
-// Specialization to compare pointers
-template <typename T>
-class CDefEquals<T*>
-{
-public:
-	CDefEquals() {}
-	CDefEquals( int i ) {}
-	inline bool operator()( const T *lhs, const T *rhs ) const 
-	{ 
-		if ( lhs == rhs	)
-			return true;
-		else if ( NULL == lhs || NULL == rhs )
-			return false;
-		else
-			return ( *lhs == *rhs );	
-	}
-	inline bool operator!() const { return false; }
-};
-
-// Specialization to compare VOID pointers AS pointers
-template <>
-class CDefEquals<void*>
-{
-public:
-	CDefEquals() {}
-	CDefEquals( int i ) {}
-	inline bool operator()( const void *lhs, const void *rhs ) const 
-	{ 
-		return ( lhs == rhs );	
-	}
-	inline bool operator!() const { return false; }
-};
-
-// Specialization to compare char * AS strings
-template <>
-class CDefEquals<const char *>
-{
-public:
-	CDefEquals() {}
-	CDefEquals( int i ) {}
-	inline bool operator()( const char *lhs, const char *rhs ) const 
-	{ 
-		return ( V_strcmp( lhs, rhs ) == 0 );
-	}
-	inline bool operator!() const { return false; }
-};
-
-// Specialization to compare char * AS strings
-template <>
-class CDefEquals < CUtlString >
-{
-public:
-	CDefEquals() {}
-	CDefEquals( int i ) {}
-	inline bool operator()( CUtlString lhs, CUtlString rhs ) const
-	{
-		return (V_strcmp( lhs.String(), rhs.String() ) == 0);
-	}
-	inline bool operator!() const { return false; }
-};
-
-//-----------------------------------------------------------------------------
-// Purpose: Case insensitive const char * comparison
-//-----------------------------------------------------------------------------
-class CDefCaselessStringEquals
-{
-public:
-	CDefCaselessStringEquals() {}
-	CDefCaselessStringEquals( int i ) {}
-	inline bool operator()( const char *lhs, const char *rhs ) const
-	{ 
-		return ( V_stricmp( lhs, rhs ) == 0 );
-	}
-	inline bool operator!() const { return false; }
-};
-
 //-----------------------------------------------------------------------------
 //
-// Purpose:	An associative container. Pretty much identical to CUtlMap without the ability to walk in-order
+// Purpose:	An associative container.  Similar to std::unordered_map,
+// but without STL's rather wacky interface.  Also, each item is not a separate
+// allocation, so insertion of items can cause existing items to move in memory.
+//
+// This differs from the one in Steam by not having any default hash or equality
+// class.  We will use std::hash and std::equal_to insetad of our own hand-rolled
+// versions, which I suspect do not add any value (any more at least).  Valve's
+// CDefEquals unfortunately is not exactly the same as std::equal_to in the way
+// it handles pointers, so let's require the few uses of hashmaps in use
+// to be explicit in the equality operation.
 //
 //-----------------------------------------------------------------------------
-template <typename K, typename T, typename L = CDefEquals<K>, typename H = HashFunctor<K> > 
+template <typename K, typename T, typename L, typename H > 
 class CUtlHashMap
 {
 public:
@@ -239,12 +158,6 @@ public:
 
 	void Swap( CUtlHashMap< K, T, L, H > &that );
 
-#ifdef DBGFLAG_VALIDATE
-	void Validate( CValidator &validator, const char *pchName );
-	void ValidateSelfAndElements( CValidator &validator, const char *pchName );
-	void ValidateSelfAndKeys( CValidator& validator, const char* pchName );
-#endif // DBGFLAG_VALIDATE
-
 protected:
 	IndexType_t InsertUnconstructed( const KeyType_t &key, IndexType_t *pExistingIndex, bool bAllowDupes );
 
@@ -347,6 +260,7 @@ inline int CUtlHashMap<K,T,L,H>::InsertUnconstructed( const KeyType_t &key, int 
 	// migrate data forward, if necessary
 	int cBucketsToModAgainst = m_vecHashBuckets.Count() >> 1;
 	int iBucket = basetypes::ModPowerOf2(hash, cBucketsToModAgainst);
+	DbgAssert( m_nMinRehashedBucket > 0 ); // The IncrementalRehash() above prevents this case
 	while ( iBucket >= m_nMinRehashedBucket
 		&& !m_bitsMigratedBuckets.GetBit( iBucket ) )
 	{
@@ -599,9 +513,12 @@ inline int CUtlHashMap<K,T,L,H>::Find( const KeyType_t &key ) const
 	if ( iNode != InvalidIndex() )
 		return iNode;
 
+	// stop before calling ModPowerOf2( hash, 0 ), which just returns the 32-bit hash, overflowing m_vecHashBuckets
+	IndexType_t cMinBucketsToModAgainst = MAX( 1, m_nMinRehashedBucket );
+
 	// not found? we may have to look in older buckets
 	cBucketsToModAgainst >>= 1;
-	while ( cBucketsToModAgainst >= m_nMinRehashedBucket )
+	while ( cBucketsToModAgainst >= cMinBucketsToModAgainst)
 	{
 		iBucket = basetypes::ModPowerOf2( hash, cBucketsToModAgainst );
 
@@ -688,7 +605,7 @@ inline int CUtlHashMap<K,T,L,H>::FindInBucket( int iBucket, const KeyType_t &key
 // Purpose: links a node into a bucket
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-void CUtlHashMap<K,T,L,H>::LinkNodeIntoBucket( int iBucket, int iNewNode )
+inline void CUtlHashMap<K,T,L,H>::LinkNodeIntoBucket( int iBucket, int iNewNode )
 {
 	// add into the start of the bucket's list
 	m_memNodes[iNewNode].m_iNextNode = m_vecHashBuckets[iBucket].m_iNode;
@@ -700,7 +617,7 @@ void CUtlHashMap<K,T,L,H>::LinkNodeIntoBucket( int iBucket, int iNewNode )
 // Purpose: unlinks a node from the bucket
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-void CUtlHashMap<K,T,L,H>::UnlinkNodeFromBucket( int iBucket, int iNodeToUnlink )
+inline void CUtlHashMap<K,T,L,H>::UnlinkNodeFromBucket( int iBucket, int iNodeToUnlink )
 {
 	int iNodeNext = m_memNodes[iNodeToUnlink].m_iNextNode;
 
@@ -892,7 +809,7 @@ inline void CUtlHashMap<K,T,L,H>::IncrementalRehash()
 // Purpose: swaps with another hash map
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-void CUtlHashMap<K,T,L,H>::Swap( CUtlHashMap<K,T,L,H> &that )
+inline void CUtlHashMap<K,T,L,H>::Swap( CUtlHashMap<K,T,L,H> &that )
 {
 	m_vecHashBuckets.Swap( that.m_vecHashBuckets );
 	SWAP( m_bitsMigratedBuckets, that.m_bitsMigratedBuckets );
@@ -903,78 +820,5 @@ void CUtlHashMap<K,T,L,H>::Swap( CUtlHashMap<K,T,L,H> &that )
 	SWAP( m_nMinRehashedBucket, that.m_nMinRehashedBucket );
 	SWAP( m_nMaxRehashedBucket, that.m_nMaxRehashedBucket );
 }
-
-
-#ifdef DBGFLAG_VALIDATE
-//-----------------------------------------------------------------------------
-// Purpose: memory validation
-//-----------------------------------------------------------------------------
-template <typename K, typename T, typename L, typename H> 
-inline void CUtlHashMap<K,T,L,H>::Validate( CValidator &validator, const char *pchName )
-{
-	VALIDATE_SCOPE();
-
-	ValidateObj( m_vecHashBuckets );
-	ValidateObj( m_memNodes );
-	ValidateObj( m_bitsMigratedBuckets );
-}
-#endif // DBGFLAG_VALIDATE
-
-
-#ifdef DBGFLAG_VALIDATE
-
-template <typename K, typename T, typename L, typename H> 
-void CUtlHashMap<K,T,L,H>::ValidateSelfAndElements( CValidator &validator, const char *pchName )
-{
-#ifdef _WIN32
-	validator.Push( typeid(*this).raw_name(), this, pchName );
-#else
-	validator.Push( typeid(*this).name(), this, pchName );
-#endif
-
-	ValidateObj( m_vecHashBuckets );
-	ValidateObj( m_memNodes );
-	ValidateObj( m_bitsMigratedBuckets );
-
-	CValidateHelper< T >	functor( validator );
-
-	FOR_EACH_HASHMAP( *this, i )
-	{
-		//	Typically, very simple types are the key, so there's no need to validate it.
-		//
-		//Key( i ).Validate( validator, "Keys" );
-		functor( Element( i ), "Elements" );
-	}
-
-	validator.Pop();
-}
-
-template <typename K, typename T, typename L, typename H> 
-void CUtlHashMap<K,T,L,H>::ValidateSelfAndKeys( CValidator &validator, const char *pchName )
-{
-#ifdef _WIN32
-	validator.Push( typeid(*this).raw_name(), this, pchName );
-#else
-	validator.Push( typeid(*this).name(), this, pchName );
-#endif
-
-	ValidateObj( m_vecHashBuckets );
-	ValidateObj( m_memNodes );
-	ValidateObj( m_bitsMigratedBuckets );
-
-	CValidateHelper< K >	functor( validator );
-
-	FOR_EACH_HASHMAP( *this, i )
-	{
-		//	Ok - complicated key, and simple element - validate the key..
-		//
-		functor( Key( i ), "Keys" );
-	}
-
-	validator.Pop();
-}
-
-#endif
-
 
 #endif // UTLHASHMAP_H

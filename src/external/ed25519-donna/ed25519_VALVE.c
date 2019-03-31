@@ -5,7 +5,7 @@
 
 #define ED25519_CUSTOMRNG
 
-#if !defined(ENABLE_OPENSSLCONNECTION) && !defined(HAVE_OPENSSL)
+#if !defined(ENABLE_OPENSSLCONNECTION) && !defined(HAVE_OPENSSL) && 0
 
 #define ED25519_CUSTOMHASH
 
@@ -401,12 +401,6 @@ void ed25519_randombytes_unsafe(void *p, size_t len) {
 void ed25519_randombytes_unsafe(void *p, size_t len) { /*boom*/ *(volatile int*)0 = 1; }
 #endif
 
-#endif
-
-/* On OSX, our clang doesn't seem to handle uint128_t properly - 32-bit + SSE2 is almost as good. */
-#if defined(__clang__) && defined(__x86_64__)
-#define ED25519_FORCE_32BIT
-#define ED25519_SSE2
 #endif
 
 #include "ed25519.c"

@@ -13,7 +13,6 @@
 #include "percentile_generator.h"
 #include "steamnetworking_stats.h"
 #include "steamnetworkingsockets_internal.h"
-#include <tier1/utllinkedlist.h>
 
 //#include <google/protobuf/repeated_field.h> // FIXME - should only need this!
 #include <tier0/memdbgoff.h>
@@ -58,7 +57,7 @@ const SteamNetworkingMicroseconds k_usecKeepAliveInterval = 10*k_nMillion;
 /// Track the rate that something is happening
 struct Rate_t
 {
-	Rate_t()  { memset( this, 0, sizeof(*this) ); }
+	void Reset() { memset( this, 0, sizeof(*this) ); }
 
 	int64	m_nTotal;
 	int64	m_nCurrentInterval;
@@ -120,10 +119,6 @@ struct PacketRate_t
 /// Class used to track ping values
 struct PingTracker
 {
-	void Reset();
-
-	/// Called when we receive a ping measurement
-	void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow );
 
 	struct Ping
 	{
@@ -152,6 +147,12 @@ struct PingTracker
 	/// Ping estimate, being optimistic
 	int OptimisticPingEstimate() const;
 
+	/// Estimate a conservative (i.e. err on the large side) timeout for the connection
+	SteamNetworkingMicroseconds CalcConservativeTimeout() const
+	{
+		return ( m_nSmoothedPing >= 0 ) ? ( PessimisticPingEstimate()*2000 + 250000 ) : k_nMillion;
+	}
+
 	/// Smoothed ping value
 	int m_nSmoothedPing;
 
@@ -160,172 +161,69 @@ struct PingTracker
 	/// a simple timestamp, or possibly because it will contain a sequence number, and
 	/// we will be able to look up that sequence number and remember when we sent it.)
 	SteamNetworkingMicroseconds m_usecTimeLastSentPingRequest;
+protected:
+	void Reset();
+
+	/// Called when we receive a ping measurement
+	void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow );
+};
+
+/// Ping tracker that tracks detailed lifetime stats
+struct PingTrackerDetailed : PingTracker
+{
+	void Reset()
+	{
+		PingTracker::Reset();
+		m_sample.Clear();
+		m_histogram.Reset();
+	}
+	void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow )
+	{
+		PingTracker::ReceivedPing( nPingMS, usecNow );
+		m_sample.AddSample( std::min( nPingMS, 0xffff ) );
+		m_histogram.AddSample( nPingMS );
+	}
 
 	/// Total number of pings we have received
 	inline int TotalPingsReceived() const { return m_sample.NumSamplesTotal(); }
 
-	/// Should match CMsgSteamDatagramLinkLifetimeStats
-	int m_nHistogram25;
-	int m_nHistogram50;
-	int m_nHistogram75;
-	int m_nHistogram100;
-	int m_nHistogram125;
-	int m_nHistogram150;
-	int m_nHistogram200;
-	int m_nHistogram300;
-	int m_nHistogramMax;
-
-	/// Track sample of pings received so we can generate a histogram.
+	/// Track sample of pings received so we can generate percentiles.
 	/// Also tracks how many pings we have received total
 	PercentileGenerator<uint16> m_sample;
-};
 
-/// An outgoing sequence number that we sent, and are expecting an ack of some kind
-/// -or- An ack that we need to send, but are pending it briefly.
-#pragma pack( push, 1 )
-struct PacketAck
-{
-	// These guys shouldn't live every long, and so assume that
-	// the difference in both the sequence number and the the timestamp
-	// can be captured using only the lower bits of each
-	uint16 m_nWireSeqNum : 16;
-	uint64 m_usecTimestamp : 48; /// When did we sent the message for which we are expecting an ack, or when did we receive the message for which we are pending an ack?
+	/// Counts by bucket
+	PingHistogram m_histogram;
 
-	static const uint64 k_nTimestampMask = 0xffffffffffffull;
-
-	inline void SetTimestamp( SteamNetworkingMicroseconds usecNow )
+	/// Populate structure
+	void GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) const
 	{
-		Assert( ( usecNow & ~k_nTimestampMask ) == 0 ); // Assume local timestamps start near zero with a process starts, and we won't run for NINE YEARS
-		m_usecTimestamp = usecNow;
-	}
+		s.m_pingHistogram  = m_histogram;
 
-	SteamNetworkingMicroseconds Timestamp( SteamNetworkingMicroseconds usecRef ) const
-	{
-		Assert( ( usecRef & ~k_nTimestampMask ) == 0 ); // Assume local timestamps start near zero with a process starts, and we won't run for NINE YEARS
-		return m_usecTimestamp;
-	}
-
-	SteamNetworkingMicroseconds MicrosecondsAge( SteamNetworkingMicroseconds usecRef ) const
-	{
-		SteamNetworkingMicroseconds usecDiff = usecRef - Timestamp( usecRef );
-		Assert( usecDiff >= -10*k_nMillion && usecDiff <= 10*k_nMillion ); // All of our timestamps should be operating within a reasonably narrow sliding window.
-		return usecDiff;
+		s.m_nPingNtile5th  = m_sample.NumSamples() < 20 ? -1 : m_sample.GetPercentile( .05f );
+		s.m_nPingNtile50th = m_sample.NumSamples() <  2 ? -1 : m_sample.GetPercentile( .50f );
+		s.m_nPingNtile75th = m_sample.NumSamples() <  4 ? -1 : m_sample.GetPercentile( .75f );
+		s.m_nPingNtile95th = m_sample.NumSamples() < 20 ? -1 : m_sample.GetPercentile( .95f );
+		s.m_nPingNtile98th = m_sample.NumSamples() < 50 ? -1 : m_sample.GetPercentile( .98f );
 	}
 };
-#pragma pack( pop )
-//COMPILE_TIME_ASSERT( sizeof(ExpectedAck) == 8 ); // FIXME PERF: this is firing, which is not good.
 
-/// Track outgoing sequence numbers for which we expect an ack of some sort, and the time we sent it
-struct ExpectedAcksTracker
+/// Ping tracker that only tracks totals
+struct PingTrackerBasic : PingTracker
 {
-	// FIXME Should add a way to allow for fixed size, because we don't want the relay doing any
-	// dynamic memory allocation or attempting to track a bunch of acks anyway.  Also a doubly-linked
-	// list is probably overkill here, since 95% of accesses will be at the head and tail, so a
-	// dequeue would be better.
-	CUtlLinkedList<PacketAck> m_listAcks;
-
-	/// Reset state
-	void Clear() { m_listAcks.RemoveAll(); }
-
-	/// Record an outgoing packet for which we expect an ack
-	void AddExpectedAck( uint16 nWireSeqNum, SteamNetworkingMicroseconds usecNow )
+	void Reset()
 	{
-		// Compare this against the last one we queued
-		int t = m_listAcks.Tail();
-		if ( t != m_listAcks.InvalidIndex() )
-		{
-			const PacketAck &last = m_listAcks[t];
-
-			// Harmlessly allow duplicates
-			if ( last.m_nWireSeqNum == nWireSeqNum )
-			{
-				Assert( last.m_usecTimestamp == uint64( usecNow&PacketAck::k_nTimestampMask) );
-				return;
-			}
-
-			// Otherwise, make sure the sequence number doesn't lurch too much.
-			// We really need to be confirming flow of packets with our peer (much)
-			// more frequently than this!
-			int16 nDiff = (int16)( nWireSeqNum - last.m_nWireSeqNum );
-			Assert( nDiff > 0 && nDiff < 0x4000 );
-			Assert( last.MicrosecondsAge( usecNow ) < k_nMillion*10 ); // We really should have already timed it out if it's older than this!
-		}
-
-		PacketAck a;
-		a.m_nWireSeqNum = nWireSeqNum;
-		a.m_usecTimestamp = usecNow;
-		m_listAcks.AddToTail( a );
-
-		// these shouldn't be allowed to stack up --- regardless of the behaviour of the remote host!
-		AssertMsg( m_listAcks.Count() < 32, "Too many expected acks!  Either we're sending packts requiring acks too fast, or else we're not expiring them properly" );
+		PingTracker::Reset();
+		m_nTotalPingsReceived = 0;
+	}
+	void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow )
+	{
+		PingTracker::ReceivedPing( nPingMS, usecNow );
+		++m_nTotalPingsReceived;
 	}
 
-	/// Check the oldest entry (if any).  If it's timed out, return true and return to caller.
-	/// Otherwise, return false.
-	bool BRemoveOldestAckIfTimedOut( PacketAck &result, SteamNetworkingMicroseconds usecExpiry )
-	{
-		// Empty?
-		int h = m_listAcks.Head();
-		if ( h == m_listAcks.InvalidIndex() )
-			return false;
+	inline int TotalPingsReceived() const { return m_nTotalPingsReceived; }
 
-		// Timed out?
-		const PacketAck &a = m_listAcks[ h ];
-		if ( a.MicrosecondsAge( usecExpiry ) < 0 )
-			return false;
-
-		// It's timed out
-		result = a;
-		m_listAcks.Remove( h );
-		return true;
-	}
-
-	/// Called when receive an ack.  Removes the record from the list, and returns
-	/// the timestamp when it was sent.  Returns 0 if we don't have a record
-	/// of it being sent
-	///
-	/// Returns <0 if something looks fishy or out of whack, and the client might
-	/// be sending us bad stuff we should squawk about
-	SteamNetworkingMicroseconds GetTimeSentAndRemoveAck( uint16 nWireSeqNum, SteamNetworkingMicroseconds usecNow )
-	{
-		// Walk list from oldest to newest.  We assume that sequence numbers are in this list in order!
-		int idx = m_listAcks.Head();
-		while ( idx != m_listAcks.InvalidIndex() )
-		{
-			PacketAck a = m_listAcks[idx];
-			int16 nSeqNumDiff = (int16)( a.m_nWireSeqNum - nWireSeqNum );
-			if ( nSeqNumDiff == 0 )
-			{
-				m_listAcks.Remove( idx );
-				return a.Timestamp( usecNow );
-			}
-
-			// Make sure the size of the sliding window of packets doesn't get too large
-			if ( nSeqNumDiff < -0x4000 )
-			{
-				Assert( a.MicrosecondsAge( usecNow ) < k_nMillion*10 ); // We really should have already timed it out if it's older than this!
-				return -1;
-			}
-
-			// All remaining acks have a subsequent sequence number?
-			if ( nSeqNumDiff > 0 )
-			{
-				if ( nSeqNumDiff > 0x4000 )
-				{
-					Assert( a.MicrosecondsAge( usecNow ) < k_nMillion*10 ); // We really should have already timed it out if it's older than this!
-					return -1;
-				}
-				break;
-			}
-
-			// Hm, ack dropped or out of order.  Scan forward and look for the
-			// one we received.  This hopefully doesn't iterate too many times.
-			idx = m_listAcks.Next( idx );
-		}
-
-		// Not found
-		return 0;
-	}
+	int m_nTotalPingsReceived;
 };
 
 /// Token bucket rate limiter
@@ -375,29 +273,22 @@ private:
 	float m_flTokenDeficitFromFull;
 };
 
+
 /// Class used to handle link quality calculations.
-struct LinkStatsTracker
+struct LinkStatsTrackerBase
 {
 
-	/// Estimate a conservative (i.e. err on the large side) timeout for the connection
-	SteamNetworkingMicroseconds CalcConservativeTimeout() const
-	{
-		return ( m_ping.m_nSmoothedPing >= 0 ) ? ( m_ping.m_nSmoothedPing*2 + 500000 ) : k_nMillion;
-	}
 
 	/// What version is the peer running?  It's 0 if we don't know yet.
 	uint32 m_nPeerProtocolVersion;
 
-	inline void SetDisconnected( bool bFlag, SteamNetworkingMicroseconds usecNow ) { if ( m_bDisconnected != bFlag ) InternalSetDisconnected( bFlag, usecNow ); }
-	inline bool IsDisconnected() const { return m_bDisconnected; }
-
 	/// Ping
-	PingTracker m_ping;
+	PingTrackerDetailed m_ping;
 
 	//
 	// Outgoing stats
 	//
-	uint64 m_unNextSendSequenceNumber;
+	int64 m_nNextSendSequenceNumber;
 	PacketRate_t m_sent;
 	SteamNetworkingMicroseconds m_usecTimeLastSentSeq;
 
@@ -412,26 +303,48 @@ struct LinkStatsTracker
 	/// Consume the next sequence number, and record the time at which
 	/// we sent a sequenced packet.  (Don't call this unless you are sending
 	/// a sequenced packet.)
-	inline uint16 GetNextSendSequenceNumber( SteamNetworkingMicroseconds usecNow )
+	inline uint16 ConsumeSendPacketNumberAndGetWireFmt( SteamNetworkingMicroseconds usecNow )
 	{
 		m_usecTimeLastSentSeq = usecNow;
-		return m_unNextSendSequenceNumber++;
+		return uint16( m_nNextSendSequenceNumber++ );
 	}
-
-	// Track acks outstanding that we expect to receive
-	ExpectedAcksTracker m_expectedAcks;
-
-	// List of acks that we are pending, seeking an opportunity to piggy back it with some other packet
-	static const int k_nMaxPendingAcks = 5;
-	bool m_bPendingAckImmediate;
-	int m_nPendingOutgoingAcks;
-	PacketAck m_arPendingOutgoingAck[k_nMaxPendingAcks];
 
 	//
 	// Incoming
 	//
-	uint64 m_unLastRecvSequenceNumber;
+
+	/// Highest (valid!) packet number we have ever processed
+	int64 m_nMaxRecvPktNum;
+
+	/// Packet and data rate trackers for inbound flow
 	PacketRate_t m_recv;
+
+	/// Setup state to expect the next packet to be nPktNum+1,
+	/// and discard all packets <= nPktNum
+	void InitMaxRecvPktNum( int64 nPktNum );
+
+	/// Bitmask of recently received packets, used to reject duplicate packets.
+	/// (Important for preventing replay attacks.)
+	///
+	/// Let B be m_nMaxRecvPktNum & ~63.  (The largest multiple of 64
+	/// that is <= m_nMaxRecvPktNum.)   Then m_recvPktNumberMask[1] bit n
+	/// corresponds to B + n.  (Some of these bits may represent packet numbers
+	/// higher than m_nMaxRecvPktNum.)  m_recvPktNumberMask[0] bit n
+	/// corresponds to B - 64 + n.
+	uint64 m_recvPktNumberMask[2];
+
+	/// Called when we receive a packet with a sequence number.
+	/// This expands the wire packet number to its full value,
+	/// and checks if it is a duplicate or out of range.
+	/// Stats are also updated
+	int64 ExpandWirePacketNumberAndCheck( uint16 nWireSeqNum )
+	{
+		int16 nGap = (int16)( nWireSeqNum - (uint16)m_nMaxRecvPktNum );
+		int64 nPktNum = m_nMaxRecvPktNum + nGap;
+		if ( !BCheckPacketNumberOldOrDuplicate( nPktNum ) )
+			return 0;
+		return nPktNum;
+	}
 
 	/// Packets that we receive that exceed the rate limit.
 	/// (We might drop these, or we might just want to be interested in how often it happens.)
@@ -454,10 +367,11 @@ struct LinkStatsTracker
 		m_usecWhenTimeoutStarted = 0;
 	}
 
-	/// Called when we receive a packet with a sequence number, to update estimated
-	/// number of dropped packets, etc.  Returns the full 64-bit sequence number
-	/// for the flow.
-	uint64 TrackRecvSequencedPacket( uint16 unWireSequenceNumber, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev );
+	/// Called when we have processed a packet with a sequence number, to update estimated
+	/// number of dropped packets, etc.  This MUST only be called after we have
+	/// called ExpandWirePacketNumberAndCheck, to ensure that the packet number is not a
+	/// duplicate or out of range.
+	void TrackProcessSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev );
 
 	//
 	// Instantaneous stats
@@ -489,23 +403,10 @@ struct LinkStatsTracker
 	PercentileGenerator<uint8> m_qualitySample;
 
 	/// Histogram of quality intervals
-	int m_nQualityHistogram100;
-	int m_nQualityHistogram99;
-	int m_nQualityHistogram97;
-	int m_nQualityHistogram95;
-	int m_nQualityHistogram90;
-	int m_nQualityHistogram75;
-	int m_nQualityHistogram50;
-	int m_nQualityHistogram1;
-	int m_nQualityHistogramDead;
+	QualityHistogram m_qualityHistogram;
 
 	// Histogram of incoming latency variance
-	int m_nJitterHistogramNegligible; // <1ms
-	int m_nJitterHistogram1; // 1--2ms
-	int m_nJitterHistogram2; // 2--5ms
-	int m_nJitterHistogram5; // 5--10ms
-	int m_nJitterHistogram10; // 10--20ms
-	int m_nJitterHistogram20; // 20ms or more
+	JitterHistogram m_jitterHistogram;
 
 	//
 	// Misc stats bookkeeping
@@ -520,7 +421,7 @@ struct LinkStatsTracker
 	/// note of the outcome.
 	inline bool BReadyToSendTracerPing( SteamNetworkingMicroseconds usecNow ) const
 	{
-		return m_ping.m_usecTimeLastSentPingRequest + k_usecLinkStatsPingRequestInterval < usecNow;
+		return !m_bDisconnected && std::max( m_ping.m_usecTimeLastSentPingRequest, m_ping.TimeRecvMostRecentPing() ) + k_usecLinkStatsPingRequestInterval < usecNow;
 	}
 
 	/// Check if we appear to be timing out and need to send an "aggressive" ping, meaning send it right
@@ -529,8 +430,9 @@ struct LinkStatsTracker
 	inline bool BNeedToSendPingImmediate( SteamNetworkingMicroseconds usecNow ) const
 	{
 		return
-			m_nReplyTimeoutsSinceLastRecv > 0 // We're timing out
-			&& m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval < usecNow; // we haven't just recently sent an agreeeisve ping.
+			!m_bDisconnected
+			&& m_nReplyTimeoutsSinceLastRecv > 0 // We're timing out
+			&& m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval < usecNow; // we haven't just recently sent an aggressive ping.
 	}
 
 	/// Check if we should send a keepalive ping.  In this case we haven't heard from the peer in a while,
@@ -538,7 +440,8 @@ struct LinkStatsTracker
 	inline bool BNeedToSendKeepalive( SteamNetworkingMicroseconds usecNow ) const
 	{
 		return
-			m_usecInFlightReplyTimeout == 0 // not already tracking some other message for which we expect a reply (and which would confirm that the connection is alive)
+			!m_bDisconnected
+			&& m_usecInFlightReplyTimeout == 0 // not already tracking some other message for which we expect a reply (and which would confirm that the connection is alive)
 			&& m_usecTimeLastRecv + k_usecKeepAliveInterval < usecNow; // haven't heard from the peer recently
 	}
 
@@ -547,7 +450,7 @@ struct LinkStatsTracker
 	inline bool BReadyToSendStats( SteamNetworkingMicroseconds usecNow )
 	{
 		bool bResult = false;
-		if ( m_seqNumInFlight == 0 && !m_bDisconnected )
+		if ( m_pktNumInFlight == 0 && !m_bDisconnected )
 		{
 			if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
 				bResult = true ;
@@ -558,24 +461,10 @@ struct LinkStatsTracker
 		return bResult;
 	}
 
-	/// Check if we really need to send some stats out, even if it means using
-	/// a less efficient standalone message type.
-	bool BNeedToSendStatsOrAcks( SteamNetworkingMicroseconds usecNow );
-
 	/// Fill out message with everything we'd like to send.  We don't assume that we will
 	/// actually send it.  (We might be looking for a good opportunity, and the data we want
 	/// to send doesn't fit.)
 	void PopulateMessage( CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow );
-
-	/// Called after we actually send connection data.  Note that we must have consumed the outgoing sequence
-	/// for that packet (using GetNextSendSequenceNumber), but must *NOT* have consumed any more!
-	void TrackSentStats( const CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply );
-
-	/// Called after we send a packet for which we expect an ack.  Note that we must have consumed the outgoing sequence
-	/// for that packet (using GetNextSendSequenceNumber), but must *NOT* have consumed any more!
-	/// This call implies TrackSentPingRequest, since we will be able to match up the ack'd sequence
-	/// number with the time sent to get a latency estimate.
-	void TrackSentMessageExpectingSeqNumAck( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply );
 
 	/// Called when we send a packet for which we expect a reply and
 	/// for which we expect to get latency info.
@@ -592,72 +481,6 @@ struct LinkStatsTracker
 	/// Called when we receive stats from remote host
 	void ProcessMessage( const CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow );
 
-	/// Called when we receive an ack.  Returns false if something seems fishy about the times.
-	bool RecvAck( uint16 nWireSeqNum, uint16 nPackedDelay, SteamNetworkingMicroseconds usecNow );
-	bool RecvPackedAcks( const google::protobuf::RepeatedField<google::protobuf::uint32> &msgField, SteamNetworkingMicroseconds usecNow )
-	{
-		bool bResult = true;
-		for ( uint32 nPackedAck: msgField )
-		{
-			if ( !RecvAck( nPackedAck>>16U, ( nPackedAck & 0xffff ), usecNow ) )
-				bResult = false;
-		}
-		return bResult;
-	}
-
-	/// Called when we send acks packed in repeated protobuf field
-	void TrackSentAck( uint16 nWireSeqNum )
-	{
-		for ( int i = 0 ; i < m_nPendingOutgoingAcks ; ++i )
-		{
-			if ( nWireSeqNum == m_arPendingOutgoingAck[i].m_nWireSeqNum )
-			{
-				--m_nPendingOutgoingAcks;
-				if ( m_nPendingOutgoingAcks == 0 )
-					m_bPendingAckImmediate = false;
-				else
-					memmove( &m_arPendingOutgoingAck[i+1], &m_arPendingOutgoingAck[i], sizeof(m_arPendingOutgoingAck[0]) * (m_nPendingOutgoingAcks-i) );
-				return;
-			}
-		}
-		AssertMsg( false, "We sent an ack that wasn't pending!" );
-	}
-
-	inline void TrackSentPackedAcks( const google::protobuf::RepeatedField<google::protobuf::uint32> &msgField )
-	{
-		if ( msgField.size() == 0 )
-			return;
-		if ( msgField.size() == m_nPendingOutgoingAcks )
-		{
-			m_nPendingOutgoingAcks = 0;
-			m_bPendingAckImmediate = false;
-		}
-		else
-		{
-			for ( uint32 nPackedAck: msgField )
-				TrackSentAck( nPackedAck>>16U );
-		}
-	}
-
-	inline void QueueOutgoingAck( uint16 nWireSeqNum, bool bImmediate, SteamNetworkingMicroseconds usecNow )
-	{
-		// Ignore redundant request to ack the same packet twice.
-		if ( m_nPendingOutgoingAcks == 0 || m_arPendingOutgoingAck[m_nPendingOutgoingAcks-1].m_nWireSeqNum != nWireSeqNum )
-		{
-			if ( m_nPendingOutgoingAcks >= k_nMaxPendingAcks )
-			{
-				if ( !bImmediate )
-					return;
-				--m_nPendingOutgoingAcks;
-			}
-			m_arPendingOutgoingAck[m_nPendingOutgoingAcks].m_nWireSeqNum = nWireSeqNum;
-			m_arPendingOutgoingAck[m_nPendingOutgoingAcks].SetTimestamp( usecNow );
-			++m_nPendingOutgoingAcks;
-		}
-		if ( bImmediate )
-			m_bPendingAckImmediate = true;
-	}
-
 	/// Received from remote host
 	SteamDatagramLinkInstantaneousStats m_latestRemote;
 	SteamNetworkingMicroseconds m_usecTimeRecvLatestRemote;
@@ -666,7 +489,7 @@ struct LinkStatsTracker
 
 	/// Local time when peer last acknowledged instantaneous stats.
 	SteamNetworkingMicroseconds m_usecPeerAckedInstaneous;
-	uint16 m_seqNumInFlight;
+	int64 m_pktNumInFlight;
 	bool m_bInFlightInstantaneous;
 	bool m_bInFlightLifetime;
 
@@ -743,25 +566,62 @@ struct LinkStatsTracker
 		m_nPktsSentSinceSentLifetime = 0;
 	}
 
+	void InFlightPktAck( SteamNetworkingMicroseconds usecNow )
+	{
+		if ( m_bInFlightInstantaneous )
+			PeerAckedInstantaneous( usecNow );
+		if ( m_bInFlightLifetime )
+			PeerAckedLifetime( usecNow );
+		m_pktNumInFlight = 0;
+		m_bInFlightInstantaneous = m_bInFlightLifetime = false;
+	}
+
+	void InFlightPktTimeout()
+	{
+		m_pktNumInFlight = 0;
+		m_bInFlightInstantaneous = m_bInFlightLifetime = false;
+	}
+
+	/// Check if we really need to flush out stats now.
+	bool BNeedToSendStats( SteamNetworkingMicroseconds usecNow );
+
 protected:
 	// Make sure it's used as abstract base.  Note that we require you to call Init()
 	// with a timestamp value, so the constructor is empty by default.
-	inline LinkStatsTracker() {}
+	inline LinkStatsTrackerBase() {}
 
 	/// Initialize the stats tracking object
 	/// We don't do this as a virtual function, since it's easy to factor the code
 	/// where outside code will just call the derived class Init() version directly,
 	/// and also give it a really specific name so we don't forget that this isn't doing any
 	/// derived class work and call it internally.
-	void InitBaseLinkStatsTracker( SteamNetworkingMicroseconds usecNow, bool bStartDisconnected );
+	void InitInternal( SteamNetworkingMicroseconds usecNow );
 
 	/// Check if it's time to update, and if so, do it.
 	/// This is another one we don't implement as a virtual function,
 	/// and this is called frequently so giving the optimizer a bit more
 	/// visibility can'thurt.
-	void ThinkBaseLinkStatsTracker( SteamNetworkingMicroseconds usecNow );
+	void ThinkInternal( SteamNetworkingMicroseconds usecNow );
+
+	void SetDisconnectedInternal( bool bFlag, SteamNetworkingMicroseconds usecNow );
 
 	void GetInstantaneousStats( SteamDatagramLinkInstantaneousStats &s ) const;
+
+	void TrackSentMessageExpectingSeqNumAckInternal( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
+	{
+		TrackSentPingRequest( usecNow, bAllowDelayedReply );
+	}
+
+	/// When the connection is terminated, we set this flag.  At that point we will no
+	/// longer expect the peer to ack, or request to flush stats, etc.  (Although we
+	/// might indicate that we need to send an ack.)
+	bool m_bDisconnected;
+
+	/// Check if we really need to flush out stats now.  Derived class should provide the reason strings.
+	/// (See the code.)
+	const char *NeedToSendStats( SteamNetworkingMicroseconds usecNow, const char *const arpszReasonStrings[4] );
+
+	SteamNetworkingMicroseconds GetNextThinkTimeInternal( SteamNetworkingMicroseconds usecNow ) const;
 
 private:
 
@@ -773,31 +633,26 @@ private:
 
 	void StartNextInterval( SteamNetworkingMicroseconds usecNow );
 
-
-	/// When the connection is terminated, we set this flag.  At that point we will no
-	/// longer expect the peer to ack, or request to flush stats, etc.  (Although we
-	/// might indicate that we need to send an ack.)
-	bool m_bDisconnected;
-
-	void InternalSetDisconnected( bool bFlag, SteamNetworkingMicroseconds usecNow );
+	/// Do internal stats handling and checking on packet number
+	bool BCheckPacketNumberOldOrDuplicate( int64 nPktNum );
 };
 
-struct LinkStatsTrackerRelay : public LinkStatsTracker
+struct LinkStatsTrackerEndToEnd : public LinkStatsTrackerBase
 {
 
-	// LinkStatsTracker "overrides"
-	void Init( SteamNetworkingMicroseconds usecNow, bool bStartDisconnected ) { InitBaseLinkStatsTracker( usecNow, bStartDisconnected ); }
-	void Think( SteamNetworkingMicroseconds usecNow ) { ThinkBaseLinkStatsTracker( usecNow ); }
-
-};
-
-struct LinkStatsTrackerEndToEnd : public LinkStatsTracker
-{
-
-	// LinkStatsTracker "overrides"
-	void Init( SteamNetworkingMicroseconds usecNow );
-	void Think( SteamNetworkingMicroseconds usecNow );
+	// LinkStatsTrackerBase "overrides"
 	virtual void GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) const OVERRIDE;
+
+	/// Calculate retry timeout the sender will use
+	SteamNetworkingMicroseconds CalcSenderRetryTimeout() const
+	{
+		if ( m_ping.m_nSmoothedPing < 0 )
+			return k_nMillion;
+		// 3 x RTT + max delay, plus some slop.
+		// If the receiver hands on to it for the max duration and
+		// our RTT is very low
+		return m_ping.m_nSmoothedPing*3000 + ( k_usecMaxDataAckDelay + 10000 );
+	}
 
 	/// Time when the current interval started
 	SteamNetworkingMicroseconds m_usecSpeedIntervalStart;
@@ -831,10 +686,104 @@ struct LinkStatsTrackerEndToEnd : public LinkStatsTracker
 	/// Called when we get a speed sample
 	void UpdateSpeeds( int nTXSpeed, int nRXSpeed );
 
+	/// Do we need to send anything?  Return the reason code, or NULL if
+	/// we don't need to send anything right now
+	inline const char *NeedToSend( SteamNetworkingMicroseconds usecNow )
+	{
+
+		// Connectivity check because we appear to be timing out?
+		if ( BNeedToSendPingImmediate( usecNow ) )
+			return "E2EUrgentPing";
+
+		// Ordinary keepalive?
+		if ( BNeedToSendKeepalive( usecNow ) )
+			return "E2EKeepalive";
+
+		// Stats?
+		static const char *arpszReasons[4] =
+		{
+			nullptr,
+			"E2EInstantaneousStats",
+			"E2ELifetimeStats",
+			"E2EAllStats"
+		};
+		return LinkStatsTrackerBase::NeedToSendStats( usecNow, arpszReasons );
+	}
+
+protected:
+	void InitInternal( SteamNetworkingMicroseconds usecNow );
+	void ThinkInternal( SteamNetworkingMicroseconds usecNow );
+
 private:
 
 	void UpdateSpeedInterval( SteamNetworkingMicroseconds usecNow );
 	void StartNextSpeedInterval( SteamNetworkingMicroseconds usecNow );
+};
+
+// LinkStatsTracker is conceptually a "base class".  However, since we want to avoid
+// runtime dispatch through virtual function tables, we've inverted this, so that the
+// type-specific class is used as a template parameter and a base class.  Any "virtual
+// functions" then can be overridden, and the compiler has full visibility and optimization
+// opportunities
+template <typename TLinkStatsTracker>
+struct LinkStatsTracker : public TLinkStatsTracker
+{
+
+	// "Virtual functions" that we are "overriding" at compile time
+	// by the template argument
+	inline void Init( SteamNetworkingMicroseconds usecNow, bool bStartDisconnected = false )
+	{
+		TLinkStatsTracker::InitInternal( usecNow );
+		TLinkStatsTracker::SetDisconnectedInternal( bStartDisconnected, usecNow );
+	}
+	inline void Think( SteamNetworkingMicroseconds usecNow ) { TLinkStatsTracker::ThinkInternal( usecNow ); }
+	inline void SetDisconnected( bool bFlag, SteamNetworkingMicroseconds usecNow ) { if ( TLinkStatsTracker::m_bDisconnected != bFlag ) TLinkStatsTracker::SetDisconnectedInternal( bFlag, usecNow ); }
+	inline bool IsDisconnected() const { return TLinkStatsTracker::m_bDisconnected; }
+
+	/// Called after we actually send connection data.  Note that we must have consumed the outgoing sequence
+	/// for that packet (using GetNextSendSequenceNumber), but must *NOT* have consumed any more!
+	void TrackSentStats( const CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
+	{
+
+		// Check if we expect our peer to know how to acknowledge this
+		if ( !TLinkStatsTracker::m_bDisconnected )
+		{
+			TLinkStatsTracker::m_pktNumInFlight = TLinkStatsTracker::m_nNextSendSequenceNumber-1;
+			TLinkStatsTracker::m_bInFlightInstantaneous = msg.has_instantaneous();
+			TLinkStatsTracker::m_bInFlightLifetime = msg.has_lifetime();
+
+			// They should ack.  Make a note of the sequence number that we used,
+			// so that we can measure latency when they reply, setup timeout bookkeeping, etc
+			TrackSentMessageExpectingSeqNumAck( usecNow, bAllowDelayedReply );
+		}
+		else
+		{
+			// Peer can't ack.  Just mark them as acking immediately
+			Assert( TLinkStatsTracker::m_pktNumInFlight == 0 );
+			TLinkStatsTracker::m_pktNumInFlight = 0;
+			TLinkStatsTracker::m_bInFlightInstantaneous = false;
+			TLinkStatsTracker::m_bInFlightLifetime = false;
+			if ( msg.has_instantaneous() )
+				TLinkStatsTracker::PeerAckedInstantaneous( usecNow );
+			if ( msg.has_lifetime() )
+				TLinkStatsTracker::PeerAckedLifetime( usecNow );
+		}
+	}
+
+	/// Called after we send a packet for which we expect an ack.  Note that we must have consumed the outgoing sequence
+	/// for that packet (using GetNextSendSequenceNumber), but must *NOT* have consumed any more!
+	/// This call implies TrackSentPingRequest, since we will be able to match up the ack'd sequence
+	/// number with the time sent to get a latency estimate.
+	inline void TrackSentMessageExpectingSeqNumAck( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
+	{
+		TLinkStatsTracker::TrackSentMessageExpectingSeqNumAckInternal( usecNow, bAllowDelayedReply );
+	}
+
+	/// Get time when we need to take action or think
+	inline SteamNetworkingMicroseconds GetNextThinkTime( SteamNetworkingMicroseconds usecNow ) const
+	{
+		return TLinkStatsTracker::GetNextThinkTimeInternal( usecNow );
+	}
 };
 
 
@@ -845,42 +794,6 @@ extern void LinkStatsInstantaneousStructToMsg( const SteamDatagramLinkInstantane
 extern void LinkStatsInstantaneousMsgToStruct( const CMsgSteamDatagramLinkInstantaneousStats &msg, SteamDatagramLinkInstantaneousStats &s );
 extern void LinkStatsLifetimeStructToMsg( const SteamDatagramLinkLifetimeStats &s, CMsgSteamDatagramLinkLifetimeStats &msg );
 extern void LinkStatsLifetimeMsgToStruct( const CMsgSteamDatagramLinkLifetimeStats &msg, SteamDatagramLinkLifetimeStats &s );
-
-inline void PutAcksIntoRepeatedField( google::protobuf::RepeatedField<uint32> &msgField, const LinkStatsTracker &stats, SteamNetworkingMicroseconds usecNow, const char *pszDebug )
-{
-	msgField.Reserve( stats.m_nPendingOutgoingAcks );
-	for ( int i = 0 ; i < stats.m_nPendingOutgoingAcks ; ++i )
-	{
-		const PacketAck &ack = stats.m_arPendingOutgoingAck[i];
-
-		SteamNetworkingMicroseconds usecThen = ack.Timestamp(usecNow);
-		SteamNetworkingMicroseconds usecDelay = usecNow - usecThen;
-		uint64 nDelayBits = usecDelay >> k_usecAckDelayPacketSerializedPrecisionShift;
-		if ( nDelayBits & 0xffffffffffff0000ull )
-		{
-			AssertMsg5( false, "%s ack was pended for %lld usec, cannot pack delay properly!  usecNow=%llx, timestamp=%llx, usecThen=%llx",
-				pszDebug, (long long)usecDelay, (unsigned long long)usecNow, (unsigned long long)ack.m_usecTimestamp, (unsigned long long)usecThen );
-			nDelayBits = 0xffff;
-		}
-		uint32 unPacked = ( uint32(ack.m_nWireSeqNum)<<16 ) | (uint16)nDelayBits;
-
-		msgField.Add( unPacked );
-	}
-}
-
-template <typename MsgType >
-void PutRelayAcksIntoMessage( MsgType &msg, const LinkStatsTracker &stats, SteamNetworkingMicroseconds usecNow )
-{
-	if ( stats.m_nPendingOutgoingAcks > 0 )
-		PutAcksIntoRepeatedField( *msg.mutable_ack_relay(), stats, usecNow, "relay" );
-}
-template <typename MsgType >
-void PutEndToEndAcksIntoMessage( MsgType &msg, const LinkStatsTracker &stats, SteamNetworkingMicroseconds usecNow )
-{
-	if ( stats.m_nPendingOutgoingAcks > 0 )
-		PutAcksIntoRepeatedField( *msg.mutable_ack_e2e(), stats, usecNow, "e2e" );
-}
-
 
 } // namespace SteamNetworkingSocketsLib
 

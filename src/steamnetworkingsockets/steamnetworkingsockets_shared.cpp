@@ -3,14 +3,12 @@
 #include <atomic>
 #include <tier1/utlbuffer.h>
 #include "steamnetworking_statsutils.h"
+#include "../tier1/ipv6text.h"
 
 // Must be the last include
 #include <tier0/memdbgon.h>
 
 using namespace SteamNetworkingSocketsLib;
-
-/// What universe are we running in?
-EUniverse SteamNetworkingSocketsLib::g_eUniverse = k_EUniverseInvalid;
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -72,25 +70,12 @@ void PingTracker::Reset()
 	m_nValidPings = 0;
 	m_nSmoothedPing = -1;
 	m_usecTimeLastSentPingRequest = 0;
-	m_sample.Clear();
-	m_nHistogram25 = 0;
-	m_nHistogram50 = 0;
-	m_nHistogram75 = 0;
-	m_nHistogram100 = 0;
-	m_nHistogram125 = 0;
-	m_nHistogram150 = 0;
-	m_nHistogram200 = 0;
-	m_nHistogram300 = 0;
-	m_nHistogramMax = 0;
 }
 
 void PingTracker::ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow )
 {
 	Assert( nPingMS >= 0 );
 	COMPILE_TIME_ASSERT( V_ARRAYSIZE(m_arPing) == 3 );
-
-	// Collect sample
-	m_sample.AddSample( Min( nPingMS, 0xffff ) );
 
 	// Discard oldest, insert new sample at head
 	m_arPing[2] = m_arPing[1];
@@ -129,46 +114,6 @@ void PingTracker::ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow
 			break;
 		}
 	}
-
-	// Update histogram using hand-rolled sort-of-binary-search, optimized
-	// for the expectation that most pings will be reasonable
-	if ( nPingMS <= 100 )
-	{
-		if ( nPingMS <= 50 )
-		{
-			if ( nPingMS <= 25 )
-				++m_nHistogram25;
-			else
-				++m_nHistogram50;
-		}
-		else
-		{
-			if ( nPingMS <= 75 )
-				++m_nHistogram75;
-			else
-				++m_nHistogram100;
-		}
-	}
-	else
-	{
-		if ( nPingMS <= 150 )
-		{
-			if ( nPingMS <= 125 )
-				++m_nHistogram125;
-			else
-				++m_nHistogram150;
-		}
-		else
-		{
-			if ( nPingMS <= 200 )
-				++m_nHistogram200;
-			else if ( nPingMS <= 300 )
-				++m_nHistogram300;
-			else
-				++m_nHistogramMax;
-		}
-	}
-
 }
 
 int PingTracker::PessimisticPingEstimate() const
@@ -197,7 +142,7 @@ int PingTracker::OptimisticPingEstimate() const
 	return nResult;
 }
 
-void LinkStatsTracker::InitBaseLinkStatsTracker( SteamNetworkingMicroseconds usecNow, bool bStartDisconnected )
+void LinkStatsTrackerBase::InitInternal( SteamNetworkingMicroseconds usecNow )
 {
 	m_nPeerProtocolVersion = 0;
 	m_bDisconnected = false;
@@ -205,9 +150,9 @@ void LinkStatsTracker::InitBaseLinkStatsTracker( SteamNetworkingMicroseconds use
 	m_recv.Reset();
 	m_recvExceedRateLimit.Reset();
 	m_ping.Reset();
-	m_unNextSendSequenceNumber = 0;
+	m_nNextSendSequenceNumber = 1;
 	m_usecTimeLastSentSeq = 0;
-	m_unLastRecvSequenceNumber = 0;
+	InitMaxRecvPktNum( 0 );
 	m_flInPacketsDroppedPct = -1.0f;
 	m_usecMaxJitterPreviousInterval = -1;
 	m_flInPacketsWeirdSequencePct = -1.0f;
@@ -224,32 +169,16 @@ void LinkStatsTracker::InitBaseLinkStatsTracker( SteamNetworkingMicroseconds use
 	m_usecTimeRecvLifetimeRemote = 0;
 	//m_seqnumUnackedSentLifetime = -1;
 	//m_seqnumPendingAckRecvTimelife = -1;
-	m_nQualityHistogram100 = 0;
-	m_nQualityHistogram99 = 0;
-	m_nQualityHistogram97 = 0;
-	m_nQualityHistogram95 = 0;
-	m_nQualityHistogram90 = 0;
-	m_nQualityHistogram75 = 0;
-	m_nQualityHistogram50 = 0;
-	m_nQualityHistogram1 = 0;
-	m_nQualityHistogramDead = 0;
+	m_qualityHistogram.Reset();
 	m_qualitySample.Clear();
-
-	m_nJitterHistogramNegligible = 0;
-	m_nJitterHistogram1 = 0;
-	m_nJitterHistogram2 = 0;
-	m_nJitterHistogram5 = 0;
-	m_nJitterHistogram10 = 0;
-	m_nJitterHistogram20 = 0;
-
-	InternalSetDisconnected( bStartDisconnected, usecNow );
+	m_jitterHistogram.Reset();
 }
 
-void LinkStatsTracker::InternalSetDisconnected( bool bFlag, SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerBase::SetDisconnectedInternal( bool bFlag, SteamNetworkingMicroseconds usecNow )
 {
 	m_bDisconnected = bFlag;
 
-	m_seqNumInFlight = 0;
+	m_pktNumInFlight = 0;
 	m_bInFlightInstantaneous = false;
 	m_bInFlightLifetime = false;
 	PeerAckedInstantaneous( usecNow );
@@ -260,9 +189,6 @@ void LinkStatsTracker::InternalSetDisconnected( bool bFlag, SteamNetworkingMicro
 	m_usecLastSendPacketExpectingImmediateReply = 0;
 	m_nReplyTimeoutsSinceLastRecv = 0;
 	m_usecWhenTimeoutStarted = 0;
-	m_expectedAcks.Clear();
-	m_nPendingOutgoingAcks = 0;
-	m_bPendingAckImmediate = false;
 
 	if ( !bFlag )
 	{
@@ -270,7 +196,7 @@ void LinkStatsTracker::InternalSetDisconnected( bool bFlag, SteamNetworkingMicro
 	}
 }
 
-void LinkStatsTracker::StartNextInterval( SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerBase::StartNextInterval( SteamNetworkingMicroseconds usecNow )
 {
 	m_nPktsRecvSequencedCurrentInterval = 0;
 	m_nPktsRecvDroppedCurrentInterval = 0;
@@ -279,7 +205,7 @@ void LinkStatsTracker::StartNextInterval( SteamNetworkingMicroseconds usecNow )
 	m_usecIntervalStart = usecNow;
 }
 
-void LinkStatsTracker::ThinkBaseLinkStatsTracker( SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerBase::ThinkInternal( SteamNetworkingMicroseconds usecNow )
 {
 	// Check for ending the current QoS interval
 	if ( !m_bDisconnected && m_usecIntervalStart + k_usecSteamDatagramLinkStatsDefaultInterval < usecNow )
@@ -301,25 +227,9 @@ void LinkStatsTracker::ThinkBaseLinkStatsTracker( SteamNetworkingMicroseconds us
 		}
 		++m_nReplyTimeoutsSinceLastRecv;
 	}
-
-	// Check for expiring expected acks.
-	if ( !m_expectedAcks.m_listAcks.IsEmpty() )
-	{
-		SteamNetworkingMicroseconds usecExpiry = usecNow - CalcConservativeTimeout();
-		PacketAck ackTimedOut;
-		while ( m_expectedAcks.BRemoveOldestAckIfTimedOut( ackTimedOut, usecExpiry ) )
-		{
-			if ( m_seqNumInFlight == ackTimedOut.m_nWireSeqNum )
-			{
-				// They probably didn't receive these stats, we should send again
-				m_seqNumInFlight = 0;
-				m_bInFlightInstantaneous = m_bInFlightLifetime = false;
-			}
-		}
-	}
 }
 
-void LinkStatsTracker::UpdateInterval( SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerBase::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 {
 	float flElapsed = int64( usecNow - m_usecIntervalStart ) * 1e-6;
 	flElapsed = Max( flElapsed, .001f ); // make sure math doesn't blow up
@@ -335,7 +245,7 @@ void LinkStatsTracker::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 			{
 				// Perfect connection.  This will hopefully be relatively common
 				m_qualitySample.AddSample( 100 );
-				++m_nQualityHistogram100;
+				++m_qualityHistogram.m_n100;
 			}
 			else
 			{
@@ -350,28 +260,28 @@ void LinkStatsTracker::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 				if ( nQuality >= 99 )
 				{
 					m_qualitySample.AddSample( 99 );
-					++m_nQualityHistogram99;
+					++m_qualityHistogram.m_n99;
 				}
 				else if ( nQuality <= 1 ) // in case accounting is hosed or every single packet was out of order, clamp.  0 means "totally dead connection"
 				{
 					m_qualitySample.AddSample( 1 );
-					++m_nQualityHistogram1;
+					++m_qualityHistogram.m_n1;
 				}
 				else
 				{
 					m_qualitySample.AddSample( nQuality );
 					if ( nQuality >= 97 )
-						++m_nQualityHistogram97;
+						++m_qualityHistogram.m_n97;
 					else if ( nQuality >= 95 )
-						++m_nQualityHistogram95;
+						++m_qualityHistogram.m_n95;
 					else if ( nQuality >= 90 )
-						++m_nQualityHistogram90;
+						++m_qualityHistogram.m_n90;
 					else if ( nQuality >= 75 )
-						++m_nQualityHistogram75;
+						++m_qualityHistogram.m_n75;
 					else if ( nQuality >= 50 )
-						++m_nQualityHistogram50;
+						++m_qualityHistogram.m_n50;
 					else
-						++m_nQualityHistogram1;
+						++m_qualityHistogram.m_n1;
 				}
 			}
 		}
@@ -383,7 +293,7 @@ void LinkStatsTracker::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 			// because the connection is just idle or shutting down.  The connection has probably
 			// dropped.
 			m_qualitySample.AddSample(0);
-			++m_nQualityHistogramDead;
+			++m_qualityHistogram.m_nDead;
 		}
 	}
 
@@ -414,21 +324,94 @@ void LinkStatsTracker::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 	StartNextInterval( usecNow );
 }
 
-uint64 LinkStatsTracker::TrackRecvSequencedPacket( uint16 unWireSequenceNumber, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev )
+void LinkStatsTrackerBase::InitMaxRecvPktNum( int64 nPktNum )
 {
+	Assert( nPktNum >= 0 );
+	m_nMaxRecvPktNum = nPktNum;
 
+	// Set bits, to mark that all values <= this packet number have been
+	// received.
+	m_recvPktNumberMask[0] = ~(uint64)0;
+	unsigned nBitsToSet = (unsigned)( nPktNum & 63 ) + 1;
+	if ( nBitsToSet == 64 )
+		m_recvPktNumberMask[1] = ~(uint64)0;
+	else
+		m_recvPktNumberMask[1] = ( (uint64)1 << nBitsToSet ) - 1;
+}
+
+bool LinkStatsTrackerBase::BCheckPacketNumberOldOrDuplicate( int64 nPktNum )
+{
+	// We've received a packet with a sequence number.
 	// Update stats
 	++m_nPktsRecvSequencedCurrentInterval;
 	++m_nPktsRecvSequenced;
 	++m_nPktsRecvSeqSinceSentLifetime;
 	++m_nPktsRecvSeqSinceSentInstantaneous;
 
+	// Packet number is increasing?
+	// (Maybe by a lot -- we don't handle that here.)
+	if ( nPktNum > m_nMaxRecvPktNum )
+		return true;
+
+	// Which block of 64-bit packets is it in?
+	int64 B = m_nMaxRecvPktNum & ~int64{63};
+	int64 idxRecvBitmask = ( ( nPktNum - B ) >> 6 ) + 1;
+	Assert( idxRecvBitmask < 2 );
+	if ( idxRecvBitmask < 0 )
+	{
+		// Too old (at least 64 packets old, maybe up to 128).
+		// Track stats, both lifetime and current interval
+		++m_nPktsRecvSequenceNumberLurch; // Should we track this under a different stat?
+		++m_nPktsRecvWeirdSequenceCurrentInterval;
+		return false;
+	}
+	uint64 bit = uint64{1} << ( nPktNum & 63 );
+	if ( m_recvPktNumberMask[ idxRecvBitmask ] & bit )
+	{
+		// Duplicate
+		// Track stats, both lifetime and current interval
+		++m_nPktsRecvDuplicate;
+		++m_nPktsRecvWeirdSequenceCurrentInterval;
+		return false;
+	}
+
+	// We have an out of order packet.  We'll update that
+	// stat in TrackProcessSequencedPacket
+	Assert( nPktNum > 0 && nPktNum < m_nMaxRecvPktNum );
+	return true;
+}
+
+void LinkStatsTrackerBase::TrackProcessSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev )
+{
+	Assert( nPktNum > 0 );
+
+	// Update bitfield of received packets
+	int64 B = m_nMaxRecvPktNum & ~int64{63};
+	int64 idxRecvBitmask = ( ( nPktNum - B ) >> 6 ) + 1;
+	Assert( idxRecvBitmask >= 0 ); // We should have discarded very old packets already
+	if ( idxRecvBitmask >= 2 ) // Most common case is 0 or 1
+	{
+		if ( idxRecvBitmask == 2 )
+		{
+			// Crossed to the next 64-packet block.  Shift bitmasks forward by one.
+			m_recvPktNumberMask[0] = m_recvPktNumberMask[1];
+		}
+		else
+		{
+			// Large packet number jump, we skipped a whole block
+			m_recvPktNumberMask[0] = 0;
+		}
+		m_recvPktNumberMask[1] = 0;
+		idxRecvBitmask = 1;
+	}
+	uint64 bit = uint64{1} << ( nPktNum & 63 );
+	Assert( !( m_recvPktNumberMask[ idxRecvBitmask ] & bit ) ); // Should not have already been marked!  We should have already discarded duplicates
+	m_recvPktNumberMask[ idxRecvBitmask ] |= bit;
+
 	// Check for dropped packet.  Since we hope that by far the most common
 	// case will be packets delivered in order, we optimize this logic
 	// for that case.
-	int16 nGap = unWireSequenceNumber - uint16( m_unLastRecvSequenceNumber );
-	uint64 unFullSequenceNumber = m_unLastRecvSequenceNumber + nGap;
-	Assert( uint16( unFullSequenceNumber ) == unWireSequenceNumber );
+	int64 nGap = nPktNum - m_nMaxRecvPktNum;
 	if ( nGap == 1 )
 	{
 
@@ -442,20 +425,7 @@ uint64 LinkStatsTracker::TrackRecvSequencedPacket( uint16 unWireSequenceNumber, 
 
 				// Update max jitter for current interval
 				m_usecMaxJitterCurrentInterval = Max( m_usecMaxJitterCurrentInterval, usecJitter );
-
-				// Add to histogram
-				if ( usecJitter < 1000 )
-					++m_nJitterHistogramNegligible;
-				else if ( usecJitter < 2000 )
-					++m_nJitterHistogram1;
-				else if ( usecJitter < 5000 )
-					++m_nJitterHistogram2;
-				else if ( usecJitter < 10000 )
-					++m_nJitterHistogram5;
-				else if ( usecJitter < 20000 )
-					++m_nJitterHistogram10;
-				else
-					++m_nJitterHistogram20;
+				m_jitterHistogram.AddSample( usecJitter );
 			}
 			else
 			{
@@ -466,59 +436,62 @@ uint64 LinkStatsTracker::TrackRecvSequencedPacket( uint16 unWireSequenceNumber, 
 	}
 	else
 	{
-		// Ignore it if we're just getting the connection bootstrapped
-		if ( m_nPktsRecvSequenced > 1 || unWireSequenceNumber != 0 )
+		// Classify imperfection based on gap size.
+		if ( nGap >= 100 )
 		{
+			// Very weird.
+			++m_nPktsRecvSequenceNumberLurch;
+			++m_nPktsRecvWeirdSequenceCurrentInterval;
 
-			// Classify imperfection based on gap size.
-			if ( nGap < -10 || nGap >= 100 )
-			{
-				// Very weird.
-				++m_nPktsRecvSequenceNumberLurch;
-				++m_nPktsRecvWeirdSequenceCurrentInterval;
+			// Continue to code below, reseting the sequence number
+			// for packets going forward.
+		}
+		else if ( nGap > 0 )
+		{
+			// Probably the most common case, we just dropped a packet
+			int nDropped = nGap-1;
+			m_nPktsRecvDropped += nDropped;
+			m_nPktsRecvDroppedCurrentInterval += nDropped;
+		}
+		else if ( nGap == 0 )
+		{
+			// We should have already rejected duplicates
+			Assert( false );
+		}
+		else
+		{
+			// Packet number moving in reverse.
+			// It should be a *small* negative step, e.g. packets delivered out of order.
+			// If the packet is really old, we should have already discarded it earlier.
+			Assert( nGap >= -8 * (int64)sizeof(m_recvPktNumberMask) );
+			++m_nPktsRecvOutOfOrder;
+			++m_nPktsRecvWeirdSequenceCurrentInterval;
 
-				// Continue to code below, reseting the sequence number
-				// for packets going forward.
-			}
-			else if ( nGap > 0 )
+			// We previously counted this packet as dropped.  Undo that, it wasn't dropped.
+			if ( m_nPktsRecvDropped > 0 )
 			{
-				// Probably the most common case, we just dropped a packet
-				int nDropped = nGap-1;
-				m_nPktsRecvDropped += nDropped;
-				m_nPktsRecvDroppedCurrentInterval += nDropped;
-			}
-			else if ( nGap == 0 )
-			{
-				// Same sequence number as last time.
-				// Packet was delivered multiple times.
-				++m_nPktsRecvDuplicate;
-				++m_nPktsRecvWeirdSequenceCurrentInterval;
-
-				// NOTE: There is no mechanism in this layer
-				// of the code to prevent the processing of
-				// the duplicate by the application layer!
+				--m_nPktsRecvDropped;
 			}
 			else
 			{
-				// Small negative gap.  Looks like packets were delivered
-				// out of order (or multiple times).
-				++m_nPktsRecvOutOfOrder;
-				++m_nPktsRecvWeirdSequenceCurrentInterval;
-
-				// DO NOT update the sequence number, because we have already received
-				// a later sequence number than this.
-				return unFullSequenceNumber;
+				// This is weird.
+				AssertMsg2( false, "No dropped packets, but pkt num %lld -> %lld and bit is not set?", (long long)m_nMaxRecvPktNum, (long long)nPktNum );
 			}
+			if ( m_nPktsRecvDroppedCurrentInterval > 0 ) // Might have marked it in the previous interval.  Our stats will be slightly off in this case.  Not worth it tro try to get this exactly right.
+				--m_nPktsRecvDroppedCurrentInterval;
+
 		}
 	}
 
-	// Save sequence number for next time.
-	m_unLastRecvSequenceNumber = unFullSequenceNumber;
-	m_usecTimeLastRecvSeq = usecNow;
-	return unFullSequenceNumber;
+	// Save highest known sequence number for next time.
+	if ( nGap > 0 )
+	{
+		m_nMaxRecvPktNum += nGap;
+		m_usecTimeLastRecvSeq = usecNow;
+	}
 }
 
-bool LinkStatsTracker::BCheckHaveDataToSendInstantaneous( SteamNetworkingMicroseconds usecNow )
+bool LinkStatsTrackerBase::BCheckHaveDataToSendInstantaneous( SteamNetworkingMicroseconds usecNow )
 {
 	Assert( !m_bDisconnected );
 
@@ -544,7 +517,7 @@ bool LinkStatsTracker::BCheckHaveDataToSendInstantaneous( SteamNetworkingMicrose
 	return false;
 }
 
-bool LinkStatsTracker::BCheckHaveDataToSendLifetime( SteamNetworkingMicroseconds usecNow )
+bool LinkStatsTrackerBase::BCheckHaveDataToSendLifetime( SteamNetworkingMicroseconds usecNow )
 {
 	Assert( !m_bDisconnected );
 
@@ -562,35 +535,64 @@ bool LinkStatsTracker::BCheckHaveDataToSendLifetime( SteamNetworkingMicroseconds
 	return false;
 }
 
-bool LinkStatsTracker::BNeedToSendStatsOrAcks( SteamNetworkingMicroseconds usecNow )
+bool LinkStatsTrackerBase::BNeedToSendStats( SteamNetworkingMicroseconds usecNow )
 {
-	// Check if any acks need to be sent now
-	if ( m_nPendingOutgoingAcks > 0 )
-	{
-		// Ack list getting full?
-		if ( m_nPendingOutgoingAcks >= k_nMaxPendingAcks )
-			return true;
-
-		// Most recent ack was requested to be sent immediately?
-		if ( m_bPendingAckImmediate )
-			return true;
-
-		// Is the oldest pending ack getting pretty stale?
-		if ( m_arPendingOutgoingAck[0].MicrosecondsAge( usecNow ) > k_usecMaxAckDelay )
-			return true;
-	}
-
 	// Message already in flight?
-	if ( m_seqNumInFlight != 0 || m_bDisconnected )
+	if ( m_pktNumInFlight != 0 || m_bDisconnected )
 		return false;
 	bool bNeedToSendInstantaneous = ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval < usecNow ) && BCheckHaveDataToSendInstantaneous( usecNow );
 	bool bNeedToSendLifetime = ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval < usecNow ) && BCheckHaveDataToSendLifetime( usecNow );
 	return bNeedToSendInstantaneous || bNeedToSendLifetime;
 }
 
-void LinkStatsTracker::PopulateMessage( CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow )
+const char *LinkStatsTrackerBase::NeedToSendStats( SteamNetworkingMicroseconds usecNow, const char *const arpszReasonStrings[4] )
 {
-	if ( m_seqNumInFlight == 0 && !m_bDisconnected )
+	// Message already in flight?
+	if ( m_pktNumInFlight != 0 || m_bDisconnected )
+		return nullptr;
+	int n = 0;
+	if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
+		n |= 1;
+	if ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval < usecNow && BCheckHaveDataToSendLifetime( usecNow ) )
+		n |= 2;
+	return arpszReasonStrings[n];
+}
+
+SteamNetworkingMicroseconds LinkStatsTrackerBase::GetNextThinkTimeInternal( SteamNetworkingMicroseconds usecNow ) const
+{
+	SteamNetworkingMicroseconds usecResult = INT64_MAX;
+	if ( !m_bDisconnected )
+	{
+
+		// Expecting a reply?
+		if ( m_usecInFlightReplyTimeout )
+		{
+			usecResult = std::min( usecResult, m_usecInFlightReplyTimeout );
+		}
+		else if ( m_usecTimeLastRecv )
+		{
+			// Time when BNeedToSendKeepalive will return true
+			usecResult = std::min( usecResult, m_usecTimeLastRecv + k_usecKeepAliveInterval );
+		}
+
+		// Time when BNeedToSendPingImmediate will return true
+		if ( m_nReplyTimeoutsSinceLastRecv > 0 )
+			usecResult = std::min( usecResult, m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval );
+
+		// Time when we need to flush stats
+		if ( m_pktNumInFlight == 0 )
+		{
+			usecResult = std::min( usecResult, m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval );
+			usecResult = std::min( usecResult, m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval );
+		}
+	}
+
+	return usecResult;
+}
+
+void LinkStatsTrackerBase::PopulateMessage( CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow )
+{
+	if ( m_pktNumInFlight == 0 && !m_bDisconnected )
 	{
 
 		// Ready to send instantaneous stats?
@@ -613,11 +615,11 @@ void LinkStatsTracker::PopulateMessage( CMsgSteamDatagramConnectionQuality &msg,
 	}
 }
 
-void LinkStatsTracker::TrackSentMessageExpectingReply( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
+void LinkStatsTrackerBase::TrackSentMessageExpectingReply( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
 {
 	if ( m_usecInFlightReplyTimeout == 0 )
 	{
-		m_usecInFlightReplyTimeout = usecNow + k_usecSteamDatagramClientPingTimeout;  // FIXME - we could be a lot smarter about this timeout using the ping estimate!
+		m_usecInFlightReplyTimeout = usecNow + m_ping.CalcConservativeTimeout();
 		if ( bAllowDelayedReply )
 			m_usecInFlightReplyTimeout += k_usecSteamDatagramRouterPendClientPing;
 	}
@@ -625,86 +627,7 @@ void LinkStatsTracker::TrackSentMessageExpectingReply( SteamNetworkingMicrosecon
 		m_usecLastSendPacketExpectingImmediateReply = usecNow;
 }
 
-void LinkStatsTracker::TrackSentMessageExpectingSeqNumAck( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
-{
-	// This counts as a ping request
-	TrackSentPingRequest( usecNow, bAllowDelayedReply );
-
-	// Remember when we sent this, so that when we receive the ack we can use it as a latency estimate
-	m_expectedAcks.AddExpectedAck( uint16( m_unNextSendSequenceNumber-1 ), usecNow );
-}
-
-bool LinkStatsTracker::RecvAck( uint16 nWireSeqNum, uint16 nPackedDelay, SteamNetworkingMicroseconds usecNow )
-{
-
-	// Acking stats that we sent?  Note that in general, we should also have an ack record
-	if ( nWireSeqNum == m_seqNumInFlight )
-	{
-		if ( m_bInFlightInstantaneous )
-			PeerAckedInstantaneous( usecNow );
-		if ( m_bInFlightLifetime )
-			PeerAckedLifetime( usecNow );
-		m_seqNumInFlight = 0;
-		m_bInFlightInstantaneous = m_bInFlightLifetime = false;
-	}
-
-	// Locate the ack
-	SteamNetworkingMicroseconds usecSent = m_expectedAcks.GetTimeSentAndRemoveAck( nWireSeqNum, usecNow );
-	if ( usecSent == 0 )
-		return true;
-	if ( usecSent < 0 )
-		return false;
-
-	SteamNetworkingMicroseconds usecTotalPing = usecNow - usecSent;
-	if ( usecTotalPing > 0 )
-	{
-
-		// Unpack the delay
-		SteamNetworkingMicroseconds usecDelay = SteamNetworkingMicroseconds(nPackedDelay) << k_usecAckDelayPacketSerializedPrecisionShift;
-
-		int msPing = ( usecTotalPing - usecDelay ) / 1000;
-		if ( msPing < -1 || msPing > 3000 )
-		{
-			// Hm - suspicious.  Let caller know so they can spew if they want to
-			return false;
-		}
-		if ( msPing < 0 )
-			msPing = 0;
-		m_ping.ReceivedPing( msPing, usecNow );
-	}
-
-	return true;
-}
-
-void LinkStatsTracker::TrackSentStats( const CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply )
-{
-
-	// Check if we expect our peer to know how to acknowledge this
-	if ( !m_bDisconnected )
-	{
-		m_seqNumInFlight = m_unNextSendSequenceNumber-1;
-		m_bInFlightInstantaneous = msg.has_instantaneous();
-		m_bInFlightLifetime = msg.has_lifetime();
-
-		// They should ack.  Make a note of the sequence number that we used,
-		// so that we can measure latency when they reply, setup timeout bookkeeping, etc
-		TrackSentMessageExpectingSeqNumAck( usecNow, bAllowDelayedReply );
-	}
-	else
-	{
-		// Peer can't ack.  Just mark them as acking immediately
-		Assert( m_seqNumInFlight == 0 );
-		m_seqNumInFlight = 0;
-		m_bInFlightInstantaneous = false;
-		m_bInFlightLifetime = false;
-		if ( msg.has_instantaneous() )
-			PeerAckedInstantaneous( usecNow );
-		if ( msg.has_lifetime() )
-			PeerAckedLifetime( usecNow );
-	}
-}
-
-void LinkStatsTracker::ProcessMessage( const CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerBase::ProcessMessage( const CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow )
 {
 	if ( msg.has_instantaneous() )
 	{
@@ -718,7 +641,7 @@ void LinkStatsTracker::ProcessMessage( const CMsgSteamDatagramConnectionQuality 
 	}
 }
 
-void LinkStatsTracker::GetInstantaneousStats( SteamDatagramLinkInstantaneousStats &s ) const
+void LinkStatsTrackerBase::GetInstantaneousStats( SteamDatagramLinkInstantaneousStats &s ) const
 {
 	s.m_flOutPacketsPerSec = m_sent.m_packets.m_flRate;
 	s.m_flOutBytesPerSec = m_sent.m_bytes.m_flRate;
@@ -730,7 +653,7 @@ void LinkStatsTracker::GetInstantaneousStats( SteamDatagramLinkInstantaneousStat
 	s.m_usecMaxJitter = m_usecMaxJitterPreviousInterval;
 }
 
-void LinkStatsTracker::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) const
+void LinkStatsTrackerBase::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) const
 {
 	s.m_nPacketsSent = m_sent.m_packets.m_nTotal;
 	s.m_nBytesSent = m_sent.m_bytes.m_nTotal;
@@ -742,43 +665,16 @@ void LinkStatsTracker::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) con
 	s.m_nPktsRecvDuplicate = m_nPktsRecvDuplicate;
 	s.m_nPktsRecvSequenceNumberLurch = m_nPktsRecvSequenceNumberLurch;
 
-	s.m_nQualityHistogram100 = m_nQualityHistogram100;
-	s.m_nQualityHistogram99 = m_nQualityHistogram99;
-	s.m_nQualityHistogram97 = m_nQualityHistogram97;
-	s.m_nQualityHistogram95 = m_nQualityHistogram95;
-	s.m_nQualityHistogram90 = m_nQualityHistogram90;
-	s.m_nQualityHistogram75 = m_nQualityHistogram75;
-	s.m_nQualityHistogram50 = m_nQualityHistogram50;
-	s.m_nQualityHistogram1 = m_nQualityHistogram1;
-	s.m_nQualityHistogramDead = m_nQualityHistogramDead;
+	s.m_qualityHistogram = m_qualityHistogram;
 
 	s.m_nQualityNtile50th = m_qualitySample.NumSamples() <  2 ? -1 : m_qualitySample.GetPercentile( .50f );
 	s.m_nQualityNtile25th = m_qualitySample.NumSamples() <  4 ? -1 : m_qualitySample.GetPercentile( .25f );
 	s.m_nQualityNtile5th  = m_qualitySample.NumSamples() < 20 ? -1 : m_qualitySample.GetPercentile( .05f );
 	s.m_nQualityNtile2nd  = m_qualitySample.NumSamples() < 50 ? -1 : m_qualitySample.GetPercentile( .02f );
 
-	s.m_nPingHistogram25  = m_ping.m_nHistogram25;
-	s.m_nPingHistogram50  = m_ping.m_nHistogram50;
-	s.m_nPingHistogram75  = m_ping.m_nHistogram75;
-	s.m_nPingHistogram100 = m_ping.m_nHistogram100;
-	s.m_nPingHistogram125 = m_ping.m_nHistogram125;
-	s.m_nPingHistogram150 = m_ping.m_nHistogram150;
-	s.m_nPingHistogram200 = m_ping.m_nHistogram200;
-	s.m_nPingHistogram300 = m_ping.m_nHistogram300;
-	s.m_nPingHistogramMax = m_ping.m_nHistogramMax;
+	m_ping.GetLifetimeStats( s );
 
-	s.m_nPingNtile5th  = m_ping.m_sample.NumSamples() < 20 ? -1 : m_ping.m_sample.GetPercentile( .05f );
-	s.m_nPingNtile50th = m_ping.m_sample.NumSamples() <  2 ? -1 : m_ping.m_sample.GetPercentile( .50f );
-	s.m_nPingNtile75th = m_ping.m_sample.NumSamples() <  4 ? -1 : m_ping.m_sample.GetPercentile( .75f );
-	s.m_nPingNtile95th = m_ping.m_sample.NumSamples() < 20 ? -1 : m_ping.m_sample.GetPercentile( .95f );
-	s.m_nPingNtile98th = m_ping.m_sample.NumSamples() < 50 ? -1 : m_ping.m_sample.GetPercentile( .98f );
-
-	s.m_nJitterHistogramNegligible = m_nJitterHistogramNegligible;
-	s.m_nJitterHistogram1 = m_nJitterHistogram1;
-	s.m_nJitterHistogram2 = m_nJitterHistogram2;
-	s.m_nJitterHistogram5 = m_nJitterHistogram5;
-	s.m_nJitterHistogram10 = m_nJitterHistogram10;
-	s.m_nJitterHistogram20 = m_nJitterHistogram20;
+	s.m_jitterHistogram = m_jitterHistogram;
 
 	//
 	// Clear all end-to-end values
@@ -819,7 +715,7 @@ void LinkStatsTracker::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) con
 	s.m_nRXSpeedNtile98th = -1;
 }
 
-void LinkStatsTracker::GetLinkStats( SteamDatagramLinkStats &s, SteamNetworkingMicroseconds usecNow ) const
+void LinkStatsTrackerBase::GetLinkStats( SteamDatagramLinkStats &s, SteamNetworkingMicroseconds usecNow ) const
 {
 	GetInstantaneousStats( s.m_latest );
 	GetLifetimeStats( s.m_lifetime );
@@ -847,11 +743,12 @@ void LinkStatsTracker::GetLinkStats( SteamDatagramLinkStats &s, SteamNetworkingM
 	}
 }
 
-void LinkStatsTrackerEndToEnd::Init( SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerEndToEnd::InitInternal( SteamNetworkingMicroseconds usecNow )
 {
-	InitBaseLinkStatsTracker( usecNow, false );
+	LinkStatsTrackerBase::InitInternal( usecNow );
 
 	m_TXSpeedSample.Clear();
+	m_nTXSpeed = 0;
 	m_nTXSpeedHistogram16 = 0; // Speed at kb/s
 	m_nTXSpeedHistogram32 = 0; 
 	m_nTXSpeedHistogram64 = 0;
@@ -862,6 +759,7 @@ void LinkStatsTrackerEndToEnd::Init( SteamNetworkingMicroseconds usecNow )
 	m_nTXSpeedHistogramMax = 0;
 
 	m_RXSpeedSample.Clear();
+	m_nRXSpeed = 0;
 	m_nRXSpeedHistogram16 = 0; // Speed at kb/s
 	m_nRXSpeedHistogram32 = 0; 
 	m_nRXSpeedHistogram64 = 0;
@@ -874,9 +772,9 @@ void LinkStatsTrackerEndToEnd::Init( SteamNetworkingMicroseconds usecNow )
 	StartNextSpeedInterval( usecNow );
 }
 
-void LinkStatsTrackerEndToEnd::Think( SteamNetworkingMicroseconds usecNow )
+void LinkStatsTrackerEndToEnd::ThinkInternal( SteamNetworkingMicroseconds usecNow )
 {
-	ThinkBaseLinkStatsTracker( usecNow );
+	LinkStatsTrackerBase::ThinkInternal( usecNow );
 
 	if ( m_usecSpeedIntervalStart + k_usecSteamDatagramSpeedStatsDefaultInterval < usecNow )
 	{
@@ -933,7 +831,7 @@ void LinkStatsTrackerEndToEnd::UpdateSpeeds( int nTXSpeed, int nRXSpeed )
 
 void LinkStatsTrackerEndToEnd::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) const
 {
-	LinkStatsTracker::GetLifetimeStats(s);
+	LinkStatsTrackerBase::GetLifetimeStats(s);
 
 	s.m_nTXSpeedMax           = m_nTXSpeedMax;
 
@@ -1032,30 +930,30 @@ void LinkStatsLifetimeStructToMsg( const SteamDatagramLinkLifetimeStats &s, CMsg
 	#define SET_HISTOGRAM( mbr, field ) if ( mbr > 0 ) msg.set_ ## field( mbr );
 	#define SET_NTILE( mbr, field ) if ( mbr >= 0 ) msg.set_ ## field( mbr );
 
-	SET_HISTOGRAM( s.m_nQualityHistogram100 , quality_histogram_100  )
-	SET_HISTOGRAM( s.m_nQualityHistogram99  , quality_histogram_99   )
-	SET_HISTOGRAM( s.m_nQualityHistogram97  , quality_histogram_97   )
-	SET_HISTOGRAM( s.m_nQualityHistogram95  , quality_histogram_95   )
-	SET_HISTOGRAM( s.m_nQualityHistogram90  , quality_histogram_90   )
-	SET_HISTOGRAM( s.m_nQualityHistogram75  , quality_histogram_75   )
-	SET_HISTOGRAM( s.m_nQualityHistogram50  , quality_histogram_50   )
-	SET_HISTOGRAM( s.m_nQualityHistogram1   , quality_histogram_1    )
-	SET_HISTOGRAM( s.m_nQualityHistogramDead, quality_histogram_dead )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n100 , quality_histogram_100  )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n99  , quality_histogram_99   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n97  , quality_histogram_97   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n95  , quality_histogram_95   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n90  , quality_histogram_90   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n75  , quality_histogram_75   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n50  , quality_histogram_50   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n1   , quality_histogram_1    )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_nDead, quality_histogram_dead )
 
 	SET_NTILE( s.m_nQualityNtile50th, quality_ntile_50th )
 	SET_NTILE( s.m_nQualityNtile25th, quality_ntile_25th )
 	SET_NTILE( s.m_nQualityNtile5th , quality_ntile_5th  )
 	SET_NTILE( s.m_nQualityNtile2nd , quality_ntile_2nd  )
 
-	SET_HISTOGRAM( s.m_nPingHistogram25 , ping_histogram_25  )
-	SET_HISTOGRAM( s.m_nPingHistogram50 , ping_histogram_50  )
-	SET_HISTOGRAM( s.m_nPingHistogram75 , ping_histogram_75  )
-	SET_HISTOGRAM( s.m_nPingHistogram100, ping_histogram_100 )
-	SET_HISTOGRAM( s.m_nPingHistogram125, ping_histogram_125 )
-	SET_HISTOGRAM( s.m_nPingHistogram150, ping_histogram_150 )
-	SET_HISTOGRAM( s.m_nPingHistogram200, ping_histogram_200 )
-	SET_HISTOGRAM( s.m_nPingHistogram300, ping_histogram_300 )
-	SET_HISTOGRAM( s.m_nPingHistogramMax, ping_histogram_max )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n25 , ping_histogram_25  )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n50 , ping_histogram_50  )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n75 , ping_histogram_75  )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n100, ping_histogram_100 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n125, ping_histogram_125 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n150, ping_histogram_150 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n200, ping_histogram_200 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n300, ping_histogram_300 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_nMax, ping_histogram_max )
 
 	SET_NTILE( s.m_nPingNtile5th , ping_ntile_5th  )
 	SET_NTILE( s.m_nPingNtile50th, ping_ntile_50th )
@@ -1063,12 +961,12 @@ void LinkStatsLifetimeStructToMsg( const SteamDatagramLinkLifetimeStats &s, CMsg
 	SET_NTILE( s.m_nPingNtile95th, ping_ntile_95th )
 	SET_NTILE( s.m_nPingNtile98th, ping_ntile_98th )
 
-	SET_HISTOGRAM( s.m_nJitterHistogramNegligible, jitter_histogram_negligible )
-	SET_HISTOGRAM( s.m_nJitterHistogram1,  jitter_histogram_1  )
-	SET_HISTOGRAM( s.m_nJitterHistogram2,  jitter_histogram_2  )
-	SET_HISTOGRAM( s.m_nJitterHistogram5,  jitter_histogram_5  )
-	SET_HISTOGRAM( s.m_nJitterHistogram10, jitter_histogram_10 )
-	SET_HISTOGRAM( s.m_nJitterHistogram20, jitter_histogram_20 )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_nNegligible, jitter_histogram_negligible )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n1,  jitter_histogram_1  )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n2,  jitter_histogram_2  )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n5,  jitter_histogram_5  )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n10, jitter_histogram_10 )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n20, jitter_histogram_20 )
 
 	if ( s.m_nTXSpeedMax > 0 )
 		msg.set_txspeed_max( s.m_nTXSpeedMax );
@@ -1125,30 +1023,30 @@ void LinkStatsLifetimeMsgToStruct( const CMsgSteamDatagramLinkLifetimeStats &msg
 	#define SET_HISTOGRAM( mbr, field ) mbr = msg.field();
 	#define SET_NTILE( mbr, field ) mbr = ( msg.has_ ## field() ? msg.field() : -1 );
 
-	SET_HISTOGRAM( s.m_nQualityHistogram100 , quality_histogram_100  )
-	SET_HISTOGRAM( s.m_nQualityHistogram99  , quality_histogram_99   )
-	SET_HISTOGRAM( s.m_nQualityHistogram97  , quality_histogram_97   )
-	SET_HISTOGRAM( s.m_nQualityHistogram95  , quality_histogram_95   )
-	SET_HISTOGRAM( s.m_nQualityHistogram90  , quality_histogram_90   )
-	SET_HISTOGRAM( s.m_nQualityHistogram75  , quality_histogram_75   )
-	SET_HISTOGRAM( s.m_nQualityHistogram50  , quality_histogram_50   )
-	SET_HISTOGRAM( s.m_nQualityHistogram1   , quality_histogram_1    )
-	SET_HISTOGRAM( s.m_nQualityHistogramDead, quality_histogram_dead )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n100 , quality_histogram_100  )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n99  , quality_histogram_99   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n97  , quality_histogram_97   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n95  , quality_histogram_95   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n90  , quality_histogram_90   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n75  , quality_histogram_75   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n50  , quality_histogram_50   )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_n1   , quality_histogram_1    )
+	SET_HISTOGRAM( s.m_qualityHistogram.m_nDead, quality_histogram_dead )
 
 	SET_NTILE( s.m_nQualityNtile50th, quality_ntile_50th )
 	SET_NTILE( s.m_nQualityNtile25th, quality_ntile_25th )
 	SET_NTILE( s.m_nQualityNtile5th , quality_ntile_5th  )
 	SET_NTILE( s.m_nQualityNtile2nd , quality_ntile_2nd  )
 
-	SET_HISTOGRAM( s.m_nPingHistogram25 , ping_histogram_25  )
-	SET_HISTOGRAM( s.m_nPingHistogram50 , ping_histogram_50  )
-	SET_HISTOGRAM( s.m_nPingHistogram75 , ping_histogram_75  )
-	SET_HISTOGRAM( s.m_nPingHistogram100, ping_histogram_100 )
-	SET_HISTOGRAM( s.m_nPingHistogram125, ping_histogram_125 )
-	SET_HISTOGRAM( s.m_nPingHistogram150, ping_histogram_150 )
-	SET_HISTOGRAM( s.m_nPingHistogram200, ping_histogram_200 )
-	SET_HISTOGRAM( s.m_nPingHistogram300, ping_histogram_300 )
-	SET_HISTOGRAM( s.m_nPingHistogramMax, ping_histogram_max )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n25 , ping_histogram_25  )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n50 , ping_histogram_50  )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n75 , ping_histogram_75  )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n100, ping_histogram_100 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n125, ping_histogram_125 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n150, ping_histogram_150 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n200, ping_histogram_200 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_n300, ping_histogram_300 )
+	SET_HISTOGRAM( s.m_pingHistogram.m_nMax, ping_histogram_max )
 
 	SET_NTILE( s.m_nPingNtile5th , ping_ntile_5th  )
 	SET_NTILE( s.m_nPingNtile50th, ping_ntile_50th )
@@ -1156,12 +1054,12 @@ void LinkStatsLifetimeMsgToStruct( const CMsgSteamDatagramLinkLifetimeStats &msg
 	SET_NTILE( s.m_nPingNtile95th, ping_ntile_95th )
 	SET_NTILE( s.m_nPingNtile98th, ping_ntile_98th )
 
-	SET_HISTOGRAM( s.m_nJitterHistogramNegligible, jitter_histogram_negligible )
-	SET_HISTOGRAM( s.m_nJitterHistogram1,  jitter_histogram_1  )
-	SET_HISTOGRAM( s.m_nJitterHistogram2,  jitter_histogram_2  )
-	SET_HISTOGRAM( s.m_nJitterHistogram5,  jitter_histogram_5  )
-	SET_HISTOGRAM( s.m_nJitterHistogram10, jitter_histogram_10 )
-	SET_HISTOGRAM( s.m_nJitterHistogram20, jitter_histogram_20 )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_nNegligible, jitter_histogram_negligible )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n1,  jitter_histogram_1  )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n2,  jitter_histogram_2  )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n5,  jitter_histogram_5  )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n10, jitter_histogram_10 )
+	SET_HISTOGRAM( s.m_jitterHistogram.m_n20, jitter_histogram_20 )
 
 	s.m_nTXSpeedMax = msg.txspeed_max();
 
@@ -1272,20 +1170,20 @@ void LinkStatsPrintLifetimeToBuf( const char *pszLeader, const SteamDatagramLink
 
 	// Do we have enough ping samples such that the distribution might be interesting
 	{
-		int nPingSamples = stats.PingHistogramTotalCount();
+		int nPingSamples = stats.m_pingHistogram.TotalCount();
 		if ( nPingSamples >= 5 )
 		{
 			float flToPct = 100.0f / nPingSamples;
 			buf.Printf( "%sPing histogram: (%d total samples)\n", pszLeader, nPingSamples );
-			buf.Printf( "%s      0-25  :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram25 , stats.m_nPingHistogram25 *flToPct );
-			buf.Printf( "%s     25-50  :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram50 , stats.m_nPingHistogram50 *flToPct );
-			buf.Printf( "%s     50-75  :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram75 , stats.m_nPingHistogram75 *flToPct );
-			buf.Printf( "%s     75-100 :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram100, stats.m_nPingHistogram100*flToPct );
-			buf.Printf( "%s    100-125 :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram125, stats.m_nPingHistogram125*flToPct );
-			buf.Printf( "%s    125-150 :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram150, stats.m_nPingHistogram150*flToPct );
-			buf.Printf( "%s    150-200 :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram200, stats.m_nPingHistogram200*flToPct );
-			buf.Printf( "%s    200-300 :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogram300, stats.m_nPingHistogram300*flToPct );
-			buf.Printf( "%s      300+  :%5d  %3.0f%%\n", pszLeader, stats.m_nPingHistogramMax, stats.m_nPingHistogramMax*flToPct );
+			buf.Printf( "%s      0-25  :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n25 , stats.m_pingHistogram.m_n25 *flToPct );
+			buf.Printf( "%s     25-50  :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n50 , stats.m_pingHistogram.m_n50 *flToPct );
+			buf.Printf( "%s     50-75  :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n75 , stats.m_pingHistogram.m_n75 *flToPct );
+			buf.Printf( "%s     75-100 :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n100, stats.m_pingHistogram.m_n100*flToPct );
+			buf.Printf( "%s    100-125 :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n125, stats.m_pingHistogram.m_n125*flToPct );
+			buf.Printf( "%s    125-150 :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n150, stats.m_pingHistogram.m_n150*flToPct );
+			buf.Printf( "%s    150-200 :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n200, stats.m_pingHistogram.m_n200*flToPct );
+			buf.Printf( "%s    200-300 :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_n300, stats.m_pingHistogram.m_n300*flToPct );
+			buf.Printf( "%s      300+  :%5d  %3.0f%%\n", pszLeader, stats.m_pingHistogram.m_nMax, stats.m_pingHistogram.m_nMax*flToPct );
 			buf.Printf( "%sPing distribution:\n", pszLeader );
 			if ( stats.m_nPingNtile5th  >= 0 ) buf.Printf( "%s     5%% of pings <= %4dms\n", pszLeader, stats.m_nPingNtile5th  );
 			if ( stats.m_nPingNtile50th >= 0 ) buf.Printf( "%s    50%% of pings <= %4dms\n", pszLeader, stats.m_nPingNtile50th );
@@ -1301,21 +1199,21 @@ void LinkStatsPrintLifetimeToBuf( const char *pszLeader, const SteamDatagramLink
 
 	// Do we have enough quality samples such that the distribution might be interesting?
 	{
-		int nQualitySamples = stats.QualityHistogramTotalCount();
+		int nQualitySamples = stats.m_qualityHistogram.TotalCount();
 		if ( nQualitySamples >= 5 )
 		{
 			float flToPct = 100.0f / nQualitySamples;
 
 			buf.Printf( "%sConnection quality histogram: (%d measurement intervals)\n", pszLeader, nQualitySamples );
-			buf.Printf( "%s     100  :%5d  %3.0f%%   (All packets received in order)\n", pszLeader, stats.m_nQualityHistogram100, stats.m_nQualityHistogram100*flToPct );
-			buf.Printf( "%s     99+  :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram99, stats.m_nQualityHistogram99*flToPct );
-			buf.Printf( "%s    97-99 :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram97, stats.m_nQualityHistogram97*flToPct );
-			buf.Printf( "%s    95-97 :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram95, stats.m_nQualityHistogram95*flToPct );
-			buf.Printf( "%s    90-95 :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram90, stats.m_nQualityHistogram90*flToPct );
-			buf.Printf( "%s    75-90 :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram75, stats.m_nQualityHistogram75*flToPct );
-			buf.Printf( "%s    50-75 :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram50, stats.m_nQualityHistogram50*flToPct );
-			buf.Printf( "%s     <50  :%5d  %3.0f%%\n", pszLeader, stats.m_nQualityHistogram1, stats.m_nQualityHistogram1*flToPct );
-			buf.Printf( "%s    dead  :%5d  %3.0f%%   (Expected to receive something but didn't)\n", pszLeader, stats.m_nQualityHistogramDead, stats.m_nQualityHistogramDead*flToPct );
+			buf.Printf( "%s     100  :%5d  %3.0f%%   (All packets received in order)\n", pszLeader, stats.m_qualityHistogram.m_n100, stats.m_qualityHistogram.m_n100*flToPct );
+			buf.Printf( "%s     99+  :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n99, stats.m_qualityHistogram.m_n99*flToPct );
+			buf.Printf( "%s    97-99 :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n97, stats.m_qualityHistogram.m_n97*flToPct );
+			buf.Printf( "%s    95-97 :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n95, stats.m_qualityHistogram.m_n95*flToPct );
+			buf.Printf( "%s    90-95 :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n90, stats.m_qualityHistogram.m_n90*flToPct );
+			buf.Printf( "%s    75-90 :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n75, stats.m_qualityHistogram.m_n75*flToPct );
+			buf.Printf( "%s    50-75 :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n50, stats.m_qualityHistogram.m_n50*flToPct );
+			buf.Printf( "%s     <50  :%5d  %3.0f%%\n", pszLeader, stats.m_qualityHistogram.m_n1, stats.m_qualityHistogram.m_n1*flToPct );
+			buf.Printf( "%s    dead  :%5d  %3.0f%%   (Expected to receive something but didn't)\n", pszLeader, stats.m_qualityHistogram.m_nDead, stats.m_qualityHistogram.m_nDead*flToPct );
 			buf.Printf( "%sConnection quality distribution:\n", pszLeader );
 			if ( stats.m_nQualityNtile50th >= 0 ) buf.Printf( "%s    50%% of intervals >= %3d%%\n", pszLeader, stats.m_nQualityNtile50th );
 			if ( stats.m_nQualityNtile25th >= 0 ) buf.Printf( "%s    75%% of intervals >= %3d%%\n", pszLeader, stats.m_nQualityNtile25th );
@@ -1330,18 +1228,18 @@ void LinkStatsPrintLifetimeToBuf( const char *pszLeader, const SteamDatagramLink
 
 	// Do we have any jitter samples?
 	{
-		int nJitterSamples = stats.JitterHistogramTotalCount();
+		int nJitterSamples = stats.m_jitterHistogram.TotalCount();
 		if ( nJitterSamples >= 1 )
 		{
 			float flToPct = 100.0f / nJitterSamples;
 
 			buf.Printf( "%sLatency variance histogram: (%d total measurements)\n", pszLeader, nJitterSamples );
-			buf.Printf( "%s     <1  :%7d  %3.0f%%\n", pszLeader, stats.m_nJitterHistogramNegligible, stats.m_nJitterHistogramNegligible*flToPct );
-			buf.Printf( "%s    1-2  :%7d  %3.0f%%\n", pszLeader, stats.m_nJitterHistogram1 , stats.m_nJitterHistogram1 *flToPct );
-			buf.Printf( "%s    2-5  :%7d  %3.0f%%\n", pszLeader, stats.m_nJitterHistogram2 , stats.m_nJitterHistogram2 *flToPct );
-			buf.Printf( "%s    5-10 :%7d  %3.0f%%\n", pszLeader, stats.m_nJitterHistogram5 , stats.m_nJitterHistogram5 *flToPct );
-			buf.Printf( "%s   10-20 :%7d  %3.0f%%\n", pszLeader, stats.m_nJitterHistogram10, stats.m_nJitterHistogram10*flToPct );
-			buf.Printf( "%s    >20  :%7d  %3.0f%%\n", pszLeader, stats.m_nJitterHistogram20, stats.m_nJitterHistogram20*flToPct );
+			buf.Printf( "%s     <1  :%7d  %3.0f%%\n", pszLeader, stats.m_jitterHistogram.m_nNegligible, stats.m_jitterHistogram.m_nNegligible*flToPct );
+			buf.Printf( "%s    1-2  :%7d  %3.0f%%\n", pszLeader, stats.m_jitterHistogram.m_n1 , stats.m_jitterHistogram.m_n1 *flToPct );
+			buf.Printf( "%s    2-5  :%7d  %3.0f%%\n", pszLeader, stats.m_jitterHistogram.m_n2 , stats.m_jitterHistogram.m_n2 *flToPct );
+			buf.Printf( "%s    5-10 :%7d  %3.0f%%\n", pszLeader, stats.m_jitterHistogram.m_n5 , stats.m_jitterHistogram.m_n5 *flToPct );
+			buf.Printf( "%s   10-20 :%7d  %3.0f%%\n", pszLeader, stats.m_jitterHistogram.m_n10, stats.m_jitterHistogram.m_n10*flToPct );
+			buf.Printf( "%s    >20  :%7d  %3.0f%%\n", pszLeader, stats.m_jitterHistogram.m_n20, stats.m_jitterHistogram.m_n20*flToPct );
 		}
 		else
 		{
@@ -1695,3 +1593,241 @@ int SteamNetworkingDetailedConnectionStatus::Print( char *pszBuf, int cbBuf )
 	return sz;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+//
+// SteamNetworkingIdentity helpers
+//
+///////////////////////////////////////////////////////////////////////////////
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamAPI_SteamNetworkingIPAddr_ToString( const SteamNetworkingIPAddr *pAddr, char *buf, size_t cbBuf, bool bWithPort )
+{
+	if ( pAddr->IsIPv4() )
+	{
+		const uint8 *ip4 = pAddr->m_ipv4.m_ip;
+		if ( bWithPort )
+			V_snprintf( buf, cbBuf, "%u.%u.%u.%u:%u", ip4[0], ip4[1], ip4[2], ip4[3], pAddr->m_port );
+		else
+			V_snprintf( buf, cbBuf, "%u.%u.%u.%u", ip4[0], ip4[1], ip4[2], ip4[3] );
+	}
+	else
+	{
+		char temp[ k_ncchMaxIPV6AddrStringWithoutPort ];
+		IPv6IPToString( temp, pAddr->m_ipv6 );
+		if ( bWithPort )
+		{
+			V_snprintf( buf, cbBuf, "[%s]:%u", temp, pAddr->m_port );
+		}
+		else
+		{
+			V_strncpy( buf, temp, cbBuf );
+		}
+	}
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE bool SteamAPI_SteamNetworkingIPAddr_ParseString( SteamNetworkingIPAddr *pAddr, const char *pszStr )
+{
+	// IPv4?
+	{
+		int n1, n2, n3, n4, n5 = 0;
+		int nRes = sscanf( pszStr, "%d.%d.%d.%d:%d", &n1, &n2, &n3, &n4, &n5 );
+		if ( nRes >= 4 )
+		{
+			pAddr->Clear();
+
+			// Make sure octets are in range 0...255 and port number is legit
+			if ( ( ( n1 | n2 | n3 | n4 ) & ~0xff ) || (uint16)n5 != n5 )
+				return false;
+
+			pAddr->m_ipv4.m_ffff = 0xffff;
+			pAddr->m_ipv4.m_ip[0] = uint8(n1);
+			pAddr->m_ipv4.m_ip[1] = uint8(n2);
+			pAddr->m_ipv4.m_ip[2] = uint8(n3);
+			pAddr->m_ipv4.m_ip[3] = uint8(n4);
+			pAddr->m_port = uint16(n5);
+			return true;
+		}
+	}
+
+	// Try IPv6
+	int port = -1;
+	uint32_t scope;
+	if ( !ParseIPv6Addr( pszStr, pAddr->m_ipv6, &port, &scope ) )
+	{
+		// ParseIPv6Addr might have modified some of the bytes -- so if we fail,
+		// just always clear everything, so that behaviour is more consistent.
+		pAddr->Clear();
+		return false;
+	}
+
+	// Return port, if it was present
+	pAddr->m_port = uint16( std::max( 0, port ) );
+
+	// Parsed successfully
+	return true;
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamAPI_SteamNetworkingIdentity_ToString( const SteamNetworkingIdentity &identity, char *buf, size_t cbBuf )
+{
+	switch ( identity.m_eType )
+	{
+		case k_ESteamNetworkingIdentityType_Invalid:
+			V_strncpy( buf, "invalid", cbBuf );
+			break;
+
+		case k_ESteamNetworkingIdentityType_SteamID:
+			V_snprintf( buf, cbBuf, "steamid:%llu", (unsigned long long)identity.m_steamID64 );
+			break;
+
+		case k_ESteamNetworkingIdentityType_IPAddress:
+			V_strncpy( buf, "ip:", cbBuf );
+			if ( cbBuf > 4 )
+				identity.m_ip.ToString( buf+3, cbBuf-3, identity.m_ip.m_port != 0 );
+			break;
+
+		case k_ESteamNetworkingIdentityType_GenericString:
+			V_snprintf( buf, cbBuf, "str:%s", identity.m_szGenericString );
+			break;
+
+		case k_ESteamNetworkingIdentityType_GenericBytes:
+			V_strncpy( buf, "gen:", cbBuf );
+			if ( cbBuf > 8 )
+			{
+				static const char hexdigits[] = "0123456789abcdef";
+				char *d = buf+7;
+				int l = std::min( identity.m_cbSize, int(cbBuf-8) / 2 );
+				for ( int i = 0 ; i < l ; ++i )
+				{
+					uint8 b = identity.m_genericBytes[i];
+					*(d++) = hexdigits[b>>4];
+					*(d++) = hexdigits[b&0xf];
+				}
+				*d = '\0';
+			}
+			break;
+
+		default:
+			V_snprintf( buf, cbBuf, "bad_type:%d", identity.m_eType );
+	}
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE bool SteamAPI_SteamNetworkingIdentity_ParseString( SteamNetworkingIdentity *pIdentity, size_t sizeofIdentity, const char *pszStr )
+{
+	const size_t sizeofHeader = offsetof( SteamNetworkingIdentity, m_cbSize ) + sizeof( pIdentity->m_cbSize );
+	COMPILE_TIME_ASSERT( sizeofHeader == 8 );
+
+	// Safety check against totally bogus size
+	if ( pIdentity == nullptr || sizeofIdentity < 32 )
+		return false;
+	memset( pIdentity, 0, sizeofIdentity );
+	if ( pszStr == nullptr || *pszStr == '\0' )
+		return false;
+
+	if ( V_stricmp( pszStr, "invalid" ) == 0 )
+		return true; // Specifically parsed as invalid is considered "success"!
+
+	size_t sizeofData = sizeofIdentity - sizeofHeader;
+
+	if ( V_strnicmp( pszStr, "steamid:", 8 ) == 0 )
+	{
+		pszStr += 8;
+		unsigned long long temp;
+		if ( sscanf( pszStr, "%llu", &temp ) != 1 )
+			return false;
+		CSteamID steamID( (uint64)temp );
+		if ( !steamID.IsValid() )
+			return false;
+		pIdentity->SetSteamID64( (uint64)temp );
+		return true;
+	}
+
+	if ( V_strnicmp( pszStr, "ip:", 3 ) == 0 )
+	{
+		pszStr += 3;
+		SteamNetworkingIPAddr tempAddr;
+		if ( sizeofData < sizeof(tempAddr) )
+			return false;
+		if ( !tempAddr.ParseString( pszStr ) )
+			return false;
+		pIdentity->SetIPAddr( tempAddr );
+		return true;
+	}
+
+	if ( V_strnicmp( pszStr, "str:", 4 ) == 0 )
+	{
+		pszStr += 4;
+		size_t l = strlen( pszStr );
+		if ( l >= sizeofData )
+			return false;
+		return pIdentity->SetGenericString( pszStr );
+	}
+
+	if ( V_strnicmp( pszStr, "gen:", 4 ) == 0 )
+	{
+		pszStr += 4;
+		size_t l = strlen( pszStr );
+		if ( l < 2 || (l & 1 ) != 0 )
+			return false;
+		size_t nBytes = l>>1;
+		uint8 tmp[ SteamNetworkingIdentity::k_cbMaxGenericBytes ];
+		if ( nBytes >= sizeofData || nBytes > sizeof(tmp) )
+			return false;
+		for ( size_t i = 0 ; i < nBytes ; ++i )
+		{
+			unsigned x;
+			if ( sscanf( pszStr, "%2x", &x ) != 1 )
+				return false;
+			tmp[i] = (uint8)x;
+			pszStr += 2;
+		}
+
+		return pIdentity->SetGenericBytes( tmp, nBytes );
+	}
+
+	// Invalid
+	return false;
+}
+
+static uint32 Murmorhash32( const void *data, size_t len )
+{
+  uint32 h = 0;
+  const uint8 *key = (const uint8 *)data;
+  if (len > 3) {
+    const uint32* key_x4 = (const uint32*) key;
+    size_t i = len >> 2;
+    do {
+      uint32 k = *key_x4++;
+      k *= 0xcc9e2d51;
+      k = (k << 15) | (k >> 17);
+      k *= 0x1b873593;
+      h ^= k;
+      h = (h << 13) | (h >> 19);
+      h = (h * 5) + 0xe6546b64;
+    } while (--i);
+    key = (const uint8*) key_x4;
+  }
+  if (len & 3) {
+    size_t i = len & 3;
+    uint32 k = 0;
+    key = &key[i - 1];
+    do {
+      k <<= 8;
+      k |= *key--;
+    } while (--i);
+    k *= 0xcc9e2d51;
+    k = (k << 15) | (k >> 17);
+    k *= 0x1b873593;
+    h ^= k;
+  }
+  h ^= len;
+  h ^= h >> 16;
+  h *= 0x85ebca6b;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35;
+  h ^= h >> 16;
+  return h;
+}
+
+uint32 SteamNetworkingIdentityHash::operator()(struct SteamNetworkingIdentity const &x ) const
+{
+	return Murmorhash32( &x, sizeof( x.m_eType ) + sizeof( x.m_cbSize ) + x.m_cbSize );
+}

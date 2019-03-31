@@ -1,90 +1,77 @@
-project('GameNetworkingSockets', 'cpp', 'c',
-  default_options: []
-)
-
-add_global_arguments('-fvisibility=hidden', language: 'cpp')
-add_global_arguments('-fvisibility-inlines-hidden', language: 'cpp')
-
 dependencies = []
 
 c_compiler = meson.get_compiler('c')
-cxx_compiler = meson.get_compiler('cpp')
 
 protoc_bin = find_program('protoc')
 protoc = generator(protoc_bin,
   output    : ['@BASENAME@.pb.cc', '@BASENAME@.pb.h'],
   arguments : ['-I@CURRENT_SOURCE_DIR@/common', '--proto_path=@CURRENT_SOURCE_DIR@', '--cpp_out=@BUILD_DIR@', '@INPUT@'])
 
+use_bcrypt = get_option('use_bcrypt')
+
+if not use_bcrypt
+  min_libcrypto = dependency('libcrypto', version: '>=1.1.0')
+  good_libcrypto = dependency('libcrypto', version: '>=1.1.1', required: false)
+
+  if good_libcrypto.found()
+    dependencies += [ good_libcrypto ]
+  else
+    dependencies += [ min_libcrypto ]
+  endif
+
+  code = '''#include <openssl/evp.h>
+  int main(int argc, char **argv) {
+    EVP_MD_CTX_free(NULL);
+    return 0;
+  }
+  '''
+  result = c_compiler.links(code, dependencies: dependencies, name: 'EVP API')
+  if not result
+    error('Your OpenSSL version appears to be too old. Check that you\'re using OpenSSL 1.1.0 or later.')
+  endif
+endif
+
+conf_data = configuration_data()
+
+conf_data.set('GNS_CRYPTO_AES_BCRYPT', false)
+conf_data.set('GNS_CRYPTO_AES_OPENSSL', false)
+conf_data.set('GNS_CRYPTO_25519_REF', false)
+conf_data.set('GNS_CRYPTO_25519_OPENSSL', false)
+
+if use_bcrypt
+  conf_data.set('GNS_CRYPTO_AES_BCRYPT', true)
+  conf_data.set('GNS_CRYPTO_25519_REF', true)
+else
+  conf_data.set('GNS_CRYPTO_AES_OPENSSL', true)
+  if good_libcrypto.found()
+    conf_data.set('GNS_CRYPTO_25519_OPENSSL', true)
+  else
+    conf_data.set('GNS_CRYPTO_25519_REF', true)
+  endif
+endif
+
+configure_file(output: 'gnsconfig.h', configuration: conf_data)
+
 dependencies += [
-  dependency('threads'),
-  dependency('openssl'),
-  dependency('protobuf'),
+  dep_threads,
+  dependency('protobuf', version: '>=3.0.0'),
 ]
 
 incdirs = include_directories('.', '../include', 'common', 'public')
 
-flags_common = [
-  '-fstack-protector-strong',
-  '-fno-strict-aliasing',
-]
-
-warn_flags_common = [
-  #'-Wall',
-  #'-Wextra',
-  #'-pedantic',
-  '-Wno-unknown-pragmas',
-  '-Wno-sign-compare',
-]
-
-warn_flags_c = [
-  '-Wstrict-prototypes',
-]
-
-warn_flags_cxx = [
-  '-Wno-reorder',
-  '-Wno-non-virtual-dtor',
-]
-
 cpp_flags = [
-  '-DSTEAMNETWORKINGSOCKETS_OPENSOURCE',
-  
-  # needed for ed25519-donna
-  '-DENABLE_CRYPTO_25519',
-  '-DHAVE_OPENSSL',
+  '-DSTEAMNETWORKINGSOCKETS_FOREXPORT',
   '-DENABLE_OPENSSLCONNECTION',
   '-DCRYPTO_DISABLE_ENCRYPT_WITH_PASSWORD',
+  '-DGOOGLE_PROTOBUF_NO_RTTI',
 ]
-
-c_flags = []
-foreach arg : warn_flags_c + flags_common + warn_flags_common
-  if c_compiler.has_argument(arg)
-	c_flags += [ arg ]
-  endif
-endforeach
-
-cxx_flags = []
-cxx_flags += cxx_compiler.first_supported_argument(['-std=c++11', '-std=c++0x'])
-foreach arg : warn_flags_cxx + flags_common + warn_flags_common
-  if cxx_compiler.has_argument(arg)
-	cxx_flags += [ arg ]
-  endif
-endforeach
 
 target_os = target_machine.system()
 
-if target_os == 'linux'
-  cpp_flags += ['-DPOSIX', '-DLINUX']
-elif target_os == 'darwin'
-  cpp_flags += ['-DPOSIX', '-DOSX']
-elif target_os == 'windows'
-  cpp_flags += ['-D_WIN32']
-else
-  error('Could not identify your target operating system')
-endif
-
-target_compiler = c_compiler.get_id()
-if target_compiler == 'gcc' or target_compiler == 'clang'
-  cpp_flags += ['-DGNUC', '-DGNU_COMPILER']
+if target_os == 'windows'
+  dependencies += [
+    c_compiler.find_library('ws2_32'),
+  ]
 endif
 
 protobuf_sources = [
@@ -94,22 +81,18 @@ protobuf_sources = [
 ]
 
 sources = [
-  'external/curve25519-donna/curve25519.c',
-  'external/curve25519-donna/curve25519_VALVE_sse2.c',
-  'external/ed25519-donna/ed25519_VALVE.c',
-  'external/ed25519-donna/ed25519_VALVE_sse2.c',
-  'external/ujson/ujson/ujson.cpp',
-  'external/ujson/ujson/double-conversion.cc',
-  'common/crypto.cpp',
-  'common/opensslwrapper.cpp',
+  'common/crypto_bcrypt.cpp',
+  'common/crypto_openssl.cpp',
+  'common/crypto_25519_donna.cpp',
+  'common/crypto_25519_openssl.cpp',
+  'common/crypto_textencode.cpp',
+  'common/keypair.cpp',
   'common/steamid.cpp',
-  'public/minbase/minbase_common_errors.cpp',
-  'steamnetworkingsockets/certtool/steamnetworkingsockets_certtool.cpp',
   'steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp',
+  'steamnetworkingsockets/clientlib/steamnetworkingsockets_flat.cpp',
   'steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.cpp',
   'steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel.cpp',
   'steamnetworkingsockets/clientlib/steamnetworkingsockets_snp.cpp',
-  'steamnetworkingsockets/clientlib/steamnetworkingsockets_snp_debug.cpp',
   'steamnetworkingsockets/clientlib/steamnetworkingsockets_udp.cpp',
   'steamnetworkingsockets/steamnetworkingsockets_certs.cpp',
   'steamnetworkingsockets/steamnetworkingsockets_shared.cpp',
@@ -117,26 +100,55 @@ sources = [
   'tier0/dbg.cpp',
   'tier0/platformtime.cpp',
   'tier1/bitstring.cpp',
-  'tier1/generichash.cpp',
+  'tier1/ipv6text.c',
   'tier1/netadr.cpp',
   'tier1/utlbuffer.cpp',
   'tier1/utlmemory.cpp',
-  'tier1/utlstring.cpp',
   'vstdlib/strtools.cpp',
 ]
 
+if use_bcrypt
+  dependencies += [ c_compiler.find_library('bcrypt') ]
+  cpp_flags += [ '-DED25519_HASH_BCRYPT' ]
+else
+  sources += [
+    'common/opensslwrapper.cpp',
+  ]
+endif
+
+# Select 25519 crypto provider
+if use_bcrypt or not good_libcrypto.found()
+  sources += [
+    'external/curve25519-donna/curve25519.c',
+    'external/curve25519-donna/curve25519_VALVE_sse2.c',
+    'external/ed25519-donna/ed25519_VALVE.c',
+    'external/ed25519-donna/ed25519_VALVE_sse2.c',
+  ]
+endif
+
 protobufs = protoc.process(protobuf_sources)
 
-static_library('GameNetworkingSockets',
+GameNetworkingSockets_static = static_library('GameNetworkingSockets',
   sources, protobufs,
-  c_args: c_flags + cpp_flags,
-  cpp_args: cxx_flags + cpp_flags,
+  c_args: cpp_flags,
+  cpp_args: cpp_flags,
   include_directories: incdirs,
   dependencies: dependencies)
 
-library('GameNetworkingSockets',
+dep_GameNetworkingSockets_static = declare_dependency(
+  include_directories: include_directories( '../include', '.' ),
+  compile_args: ['-DSTEAMNETWORKINGSOCKETS_STATIC_LINK'],
+  link_with: GameNetworkingSockets_static )
+
+GameNetworkingSockets_so = library('GameNetworkingSockets',
   sources, protobufs,
-  c_args: c_flags + cpp_flags,
-  cpp_args: cxx_flags + cpp_flags,
+  c_args: cpp_flags,
+  cpp_args: cpp_flags,
   include_directories: incdirs,
   dependencies: dependencies)
+
+dep_GameNetworkingSockets_so = declare_dependency(
+  include_directories: include_directories( '../include', '.' ),
+  link_with: GameNetworkingSockets_so )
+
+# vim: set ts=2 sts=2 sw=2 et:

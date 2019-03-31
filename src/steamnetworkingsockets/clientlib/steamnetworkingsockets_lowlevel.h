@@ -6,13 +6,12 @@
 #pragma once
 #endif
 
+#include <atomic>
 #include <cstdint>
-#include <steamnetworkingsockets/steamnetworkingtypes.h>
-#include <steamnetworkingsockets/isteamnetworkingsockets.h>
-#include "tier1/netadr.h"
-#include "tier1/utlmap.h"
-//#include <logger.h>
-//#include <globals.h>
+#include <functional>
+#include <steam/steamnetworkingtypes.h>
+#include <tier1/netadr.h>
+#include <tier1/utlhashmap.h>
 
 struct iovec;
 
@@ -60,11 +59,12 @@ class IRawUDPSocket
 public:
 	/// A thin wrapper around ::sendto
 	///
-	/// Packets sent through this method are subject to fake loss (steamdatagram_fakepacketloss_send)
-	/// and fake lag (steamdatagram_fakepacketlag_send)
+	/// Packets sent through this method are subject to fake loss (steamdatagram_fakepacketloss_send),
+	/// lag (steamdatagram_fakepacketlag_send and steamdatagram_fakepacketreorder_send), and
+	/// duplication (steamdatagram_fakepacketdup_send)
 	bool BSendRawPacket( const void *pPkt, int cbPkt, const netadr_t &adrTo ) const;
 
-	/// Gather-based send
+	/// Gather-based send.  Simulated lag, loss, etc are applied
 	bool BSendRawPacketGather( int nChunks, const iovec *pChunks, const netadr_t &adrTo ) const;
 
 	/// Logically close the socket.  This might not actually close the socket IMMEDIATELY,
@@ -72,18 +72,37 @@ public:
 	/// get any further callbacks.
 	void Close();
 
-	/// The port we ended up binding to
-	uint16 m_nPort;
+	/// The local address we ended up binding to
+	SteamNetworkingIPAddr m_boundAddr;
 
 protected:
 	IRawUDPSocket();
 	~IRawUDPSocket();
 };
 
-/// Create a UDP socket, set all the socket options for non-blocking, etc, bind it to the desired interface and port (or use 0
-/// to bind to "any" interface and get an ephemeral port), and make sure we're setup to poll the socket efficiently and deliver
-/// packets received to the specified callback.
-extern IRawUDPSocket *OpenRawUDPSocket( uint32 nIP, uint16 nPort, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg );
+const int k_nAddressFamily_Auto = -1; // Will try to use IPv6 dual stack if possible.  Falls back to IPv4 if necessary (and possible for your requested bind address)
+const int k_nAddressFamily_IPv4 = 1;
+const int k_nAddressFamily_IPv6 = 2;
+const int k_nAddressFamily_DualStack = k_nAddressFamily_IPv4|k_nAddressFamily_IPv6;
+
+/// Create a UDP socket, set all the socket options for non-blocking, etc, bind it to the desired interface and port, and
+/// make sure we're setup to poll the socket efficiently and deliver packets received to the specified callback.
+///
+/// Local address is interpreted as follows:
+/// - If a specific IPv6 or IPv4 address is present, we will try to bind to that interface,
+///   and dual-stack will be disabled.
+/// - If IPv4 0.0.0.0 is specified, only bind for IPv4
+/// - If IPv6 ::0 is specified, consult pnAddressFamilies.
+///
+/// Address family is interpreted as follows:
+/// - k_nAddressFamily_IPv4/k_nAddressFamily_IPv6: only bind for that protocol
+/// - k_nAddressFamily_DualStack: Fail if we cannot get dual stack
+/// - k_nAddressFamily_Auto (or null): Try dual stack if address is ::0 or null,
+///   otherwise use single protocol.
+///
+/// Upon exit, the address and address families are modified to contain the actual bound
+/// address (specifically, the port!) and available address families.
+extern IRawUDPSocket *OpenRawUDPSocket( CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg, SteamNetworkingIPAddr *pAddrLocal, int *pnAddressFamilies );
 
 /// A single socket could, in theory, be used to communicate with every single remote host.
 /// Or we may decide to open up one socket per remote host, to workaround weird firewall/NAT
@@ -129,7 +148,7 @@ protected:
 
 /// Get a socket to talk to a single host.  The underlying socket won't be
 /// shared with anybody else.
-extern IBoundUDPSocket *OpenUDPSocketBoundToHost( uint32 nLocalIP, uint16 nLocalPort, const netadr_t &adrRemote, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg );
+extern IBoundUDPSocket *OpenUDPSocketBoundToHost( const netadr_t &adrRemote, CRecvPacketCallback callback, SteamDatagramErrMsg &errMsg );
 
 /// Create a pair of sockets that are bound to talk to each other.
 extern bool CreateBoundSocketPair( CRecvPacketCallback callback1, CRecvPacketCallback callback2, IBoundUDPSocket **ppOutSockets, SteamDatagramErrMsg &errMsg );
@@ -143,7 +162,7 @@ public:
 
 	/// Allocate a raw socket and setup bookkeeping structures so we can add
 	/// clients that will talk using it.
-	bool BInit( uint32 nIP, uint16 nPort, CRecvPacketCallback callbackDefault, SteamDatagramErrMsg &errMsg );
+	bool BInit( const SteamNetworkingIPAddr &localAddr, CRecvPacketCallback callbackDefault, SteamDatagramErrMsg &errMsg );
 
 	/// Close all sockets and clean up all resources
 	void Kill();
@@ -157,6 +176,16 @@ public:
 	bool BSendRawPacket( const void *pPkt, int cbPkt, const netadr_t &adrTo ) const
 	{
 		return m_pRawSock->BSendRawPacket( pPkt, cbPkt, adrTo );
+	}
+
+	const SteamNetworkingIPAddr *GetBoundAddr() const
+	{
+		if ( !m_pRawSock )
+		{
+			Assert( false );
+			return nullptr;
+		}
+		return &m_pRawSock->m_boundAddr;
 	}
 
 private:
@@ -188,7 +217,7 @@ private:
 	/// doesn't have that interface yet.  Also, it's probably better to
 	/// waste a tiny bit of space and put the keys close together in memory,
 	/// anyway.
-	CUtlOrderedMap<netadr_t, RemoteHost *> m_mapRemoteHosts;
+	CUtlHashMap<netadr_t, RemoteHost *, std::equal_to<netadr_t>, netadr_t::Hash > m_mapRemoteHosts;
 
 	void CloseRemoteHostByIndex( int idx );
 
@@ -273,38 +302,49 @@ private:
 //
 /////////////////////////////////////////////////////////////////////////////
 
-/// Fetch current time
-extern SteamNetworkingMicroseconds SteamDatagram_GetCurrentTime();
-
 /// Flag to signal that we want to be active.  If this is false, either
 /// we haven't activated a service that needs the service thread, or
 /// we've failed to initialize, or we're shutting down.
-extern volatile bool g_bWantThreadRunning;
-extern volatile bool g_bThreadInMainThread;
-
-/// If running in main thread pump the thread
-extern void CallDatagramThreadProc();
+extern std::atomic<bool> g_bWantThreadRunning;
 
 /// Called when we know it's safe to actually destroy sockets pending deletion.
 /// This is when: 1.) We own the lock and 2.) we aren't polling in the service thread.
 extern void ProcessPendingDestroyClosedRawUDPSockets();
 
-extern ESteamDatagramDebugOutputType g_eSteamDatagramDebugOutputDetailLevel;
-extern void ReallySpewType( ESteamDatagramDebugOutputType eType, PRINTF_FORMAT_STRING const char *pMsg, ... ) FMTFUNCTION( 2, 3 );
-#define SpewType( eType, ... ) ( ( eType <= g_eSteamDatagramDebugOutputDetailLevel ) ? ReallySpewType( eType, __VA_ARGS__ ) : (void)0 )
-#define SpewMsg( ... ) SpewType( k_ESteamDatagramDebugOutputType_Msg, __VA_ARGS__ )
-#define SpewVerbose( ... ) SpewType( k_ESteamDatagramDebugOutputType_Verbose, __VA_ARGS__ )
-#define SpewDebug( ... ) SpewType( k_ESteamDatagramDebugOutputType_Debug, __VA_ARGS__ )
-#define SpewImportant( ... ) SpewType( k_ESteamDatagramDebugOutputType_Important, __VA_ARGS__ )
-#define SpewWarning( ... ) SpewType( k_ESteamDatagramDebugOutputType_Warning, __VA_ARGS__ )
-#define SpewError( ... ) SpewType( k_ESteamDatagramDebugOutputType_Error, __VA_ARGS__ )
-#define SpewBug( ... ) SpewType( k_ESteamDatagramDebugOutputType_Bug, __VA_ARGS__ )
+/// Last time that we spewed something that was subject to rate limit 
+extern SteamNetworkingMicroseconds g_usecLastRateLimitSpew;
+
+/// Check for rate limiting spew (e.g. when spew could be triggered by malicious sender.)
+inline bool BRateLimitSpew( SteamNetworkingMicroseconds usecNow )
+{
+	if ( usecNow < g_usecLastRateLimitSpew + 100000 )
+		return false;
+	g_usecLastRateLimitSpew = usecNow;
+	return true;
+}
+
+extern ESteamNetworkingSocketsDebugOutputType g_eSteamDatagramDebugOutputDetailLevel;
+extern void ReallySpewType( ESteamNetworkingSocketsDebugOutputType eType, PRINTF_FORMAT_STRING const char *pMsg, ... ) FMTFUNCTION( 2, 3 );
+#define SpewType( eType, ... ) ( ( (eType) <= g_eSteamDatagramDebugOutputDetailLevel ) ? ReallySpewType( ESteamNetworkingSocketsDebugOutputType(eType), __VA_ARGS__ ) : (void)0 )
+#define SpewMsg( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Msg, __VA_ARGS__ )
+#define SpewVerbose( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Verbose, __VA_ARGS__ )
+#define SpewDebug( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Debug, __VA_ARGS__ )
+#define SpewImportant( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Important, __VA_ARGS__ )
+#define SpewWarning( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Warning, __VA_ARGS__ )
+#define SpewError( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Error, __VA_ARGS__ )
+#define SpewBug( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Bug, __VA_ARGS__ )
+
+#define SpewTypeRateLimited( usecNow, eType, ... ) ( ( (eType) <= g_eSteamDatagramDebugOutputDetailLevel && BRateLimitSpew( usecNow ) ) ? ReallySpewType( (eType), __VA_ARGS__ ) : (void)0 )
+#define SpewMsgRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Msg, __VA_ARGS__ )
+#define SpewWarningRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Warning, __VA_ARGS__ )
+#define SpewErrorRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Error, __VA_ARGS__ )
+#define SpewBugRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Bug, __VA_ARGS__ )
 
 /// Make sure stuff is initialized
-extern bool BSteamNetworkingSocketsInitCommon( SteamDatagramErrMsg &errMsg );
+extern bool BSteamNetworkingSocketsLowLevelAddRef( SteamDatagramErrMsg &errMsg );
 
 /// Nuke common stuff
-extern void SteamNetworkingSocketsKillCommon();
+extern void SteamNetworkingSocketsLowLevelDecRef();
 
 /// Scope lock object used to synchronize access to internal data structures.  We use a global lock,
 /// even though in some cases it might not be necessary, to simplify the code, since in most cases
@@ -314,11 +354,23 @@ struct SteamDatagramTransportLock
 	inline SteamDatagramTransportLock() { Lock(); }
 	inline ~SteamDatagramTransportLock() { Unlock(); }
 	static void Lock();
+	static bool TryLock( int msTimeout );
 	static void Unlock();
 	static void OnLocked();
 	static void AssertHeldByCurrentThread();
-	static volatile int s_nLocked;
+	static void SetLongLockWarningThresholdMS( int msWarningThreshold );
+	static int s_nLocked;
 };
+
+#ifdef DBGFLAG_VALIDATE
+extern void SteamNetworkingSocketsLowLevelValidate( CValidator &validator );
+#endif
+
+/// Fetch current time
+SteamNetworkingMicroseconds SteamNetworkingSockets_GetLocalTimestamp();
+
+/// Set debug output hook
+void SteamNetworkingSockets_SetDebugOutputFunction( ESteamNetworkingSocketsDebugOutputType eDetailLevel, FSteamNetworkingSocketsDebugOutput pfnFunc );
 
 } // namespace SteamNetworkingSocketsLib
 

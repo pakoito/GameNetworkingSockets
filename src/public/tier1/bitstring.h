@@ -360,8 +360,8 @@ inline void CBitStringT<BASE_OPS>::ClearBit(int bitNum)
 template <class BASE_OPS>
 inline void CBitStringT<BASE_OPS>::And(const CBitStringT &addStr, CBitStringT *out) const
 {
-	ValidateOperand( addStr );
-	ValidateOperand( *out );
+	this->ValidateOperand( addStr );
+	this->ValidateOperand( *out );
 	
 	int *	   pDest		= out->GetInts();
 	const int *pOperand1	= this->GetInts();
@@ -381,8 +381,8 @@ inline void CBitStringT<BASE_OPS>::And(const CBitStringT &addStr, CBitStringT *o
 template <class BASE_OPS>
 inline void CBitStringT<BASE_OPS>::Or(const CBitStringT &orStr, CBitStringT *out) const
 {
-	ValidateOperand( orStr );
-	ValidateOperand( *out );
+	this->ValidateOperand( orStr );
+	this->ValidateOperand( *out );
 
 	int *	   pDest		= out->GetInts();
 	const int *pOperand1	= this->GetInts();
@@ -420,7 +420,7 @@ inline void CBitStringT<BASE_OPS>::Xor(const CBitStringT &xorStr, CBitStringT *o
 template <class BASE_OPS>
 inline void CBitStringT<BASE_OPS>::Not(CBitStringT *out) const
 {
-	ValidateOperand( *out );
+	this->ValidateOperand( *out );
 
 	int *	   pDest	= out->GetInts();
 	const int *pOperand	= this->GetInts();
@@ -439,7 +439,7 @@ inline void CBitStringT<BASE_OPS>::Not(CBitStringT *out) const
 template <class BASE_OPS>
 inline void CBitStringT<BASE_OPS>::Copy(CBitStringT *out) const
 {
-	ValidateOperand( *out );
+	this->ValidateOperand( *out );
 	Assert( out != this );
 	
 	memcpy( out->GetInts(), this->GetInts(), this->GetNumInts() * sizeof( int ) );
